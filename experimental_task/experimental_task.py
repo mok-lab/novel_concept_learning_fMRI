@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Study 3: Experiment Runner
+Novel Concept Learning: Experiment Runner
 Supports:
  1. Standard (2-Event: Dec -> Fb)
  2. Self-Paced (3-Event: Img -> Jitter -> Dec -> Fix -> Fb)
@@ -13,7 +13,7 @@ Features:
  - Demo Mode: Displays condition text on right side
  - Centered Images: Images now appear at (0,0)
 
-ADDED (Jan 2026):
+ADDED:
  - Multi-run support: if the design CSV contains a run/block column, the task will
    pause *between runs* by closing the fullscreen window, showing a native GUI dialog
    to start the next run, then re-opening fullscreen and showing the trigger screen.
@@ -30,30 +30,34 @@ import random
 import re
 
 # =========================== CONFIGURATION =========================== #
+# Keys used by the task. Numeric keys map to response options; TRIGGER_KEY used
+# to start a run (scanner trigger simulation). EXIT_KEY exits the experiment.
 KEYS_RESP = ['1', '2', '9', '0']
 TRIGGER_KEY = '5'
 EXIT_KEY = 'escape'
 SKIP_KEY = 'right'  # Demo Mode only
 
-# Colors
+# Colors used for buttons / feedback. Keep names descriptive to make intent clear.
 COL_NEUTRAL   = 'grey'
 COL_HOVER     = 'lightgrey'
-COL_SELECT    = 'green'      # Color during selection
-COL_CORRECT   = 'green'      # Feedback Correct
-COL_INCORRECT = 'red'        # Feedback Incorrect
+COL_SELECT    = 'green'      # Color during selection (not used for fill)
+COL_CORRECT   = 'green'      # Feedback Correct (border)
+COL_INCORRECT = 'red'        # Feedback Incorrect (border)
 TEXT_COLOR    = 'black'
 DEMO_TEXT_COL = 'blue'
 
-# Button line widths
+# Button line widths: normal and highlighted for feedback
 LINE_W_NORMAL = 2
 LINE_W_HIGHLIGHT = 6
 
-# Selection fill (during decision)
+# Selection fill color used to indicate currently chosen option during decision
 COL_SELECT_FILL = 'white'
 
+# Supported image file extensions for scanning image directories
 IMG_EXTS = ['.png', '.jpg', '.jpeg', '.bmp']
 
-# Run column candidates (first match wins)
+# Candidate column names to detect run/block/session grouping in design CSVs.
+# The first matching name in RUN_COL_CANDIDATES will be used.
 RUN_COL_CANDIDATES = [
     'run', 'run_id', 'run_num', 'run_number',
     'block', 'block_id', 'block_num', 'block_number',
@@ -65,14 +69,18 @@ RUN_COL_CANDIDATES = [
 def load_label_map(csv_path, key_col='ObjectSpace'):
     """Load label mapping from the stimulus info CSV.
 
-    Expected columns:
-      - key_col (default: 'ObjectSpace')
-      - 'Congruent', 'Medium', 'Incongruent'
+    The label CSV is expected to contain at least:
+      - a key column identifying an object space (default: 'ObjectSpace')
+      - 'Congruent', 'Medium', 'Incongruent' columns providing label strings
 
     Returns:
-      (label_map, all_labels)
-        - label_map: dict[str, dict[str, str]]
-        - all_labels: list[str] of all unique labels (for distractor pool)
+      tuple: (label_map, all_labels)
+        - label_map: dict mapping space_id -> {'Congruent':..., 'Medium':..., 'Incongruent':...}
+        - all_labels: sorted list of unique label strings across all spaces (used as distractor pool)
+
+    Notes:
+      - Uses pandas with engine='python' to allow flexible CSV separators when needed.
+      - Raises ValueError if expected columns are missing so the caller can fail fast.
     """
     df = pd.read_csv(csv_path, sep=None, dtype={key_col: str}, engine="python")
     required = {key_col, 'Congruent', 'Medium', 'Incongruent'}
@@ -95,13 +103,16 @@ def load_label_map(csv_path, key_col='ObjectSpace'):
     all_labels = sorted(all_labels)
     return label_map, all_labels
 
+
 def build_participant_label_pool(design_df, label_map, space_col_candidates=('ObjectSpace','group')):
-    """Build a label pool limited to ObjectSpaces present in this participant's design CSV.
+    """Build a restricted distractor pool for this participant.
 
-    Pool contains all labels (Congruent/Medium/Incongruent) for those ObjectSpaces.
-    This is used for sampling distractors so that choices are drawn only from the participant's own set.
+    The pool is limited to labels belonging to ObjectSpaces that actually appear in the
+    participant's design CSV. This reduces the chance of presenting distractors from
+    object spaces the participant never sees, which could be confusing.
 
-    If no matching ObjectSpace column is found, falls back to all labels in label_map.
+    If no recognized space column exists in the design file the function falls back to
+    returning all labels from the label_map (safe default).
     """
     space_col = None
     for c in space_col_candidates:
@@ -109,31 +120,43 @@ def build_participant_label_pool(design_df, label_map, space_col_candidates=('Ob
             space_col = c
             break
     if space_col is None:
-        # Fallback: use all labels
+        # Fallback: use all labels when the design has no recognizable space column
         pool = set()
         for d in label_map.values():
             pool.update(d.values())
         return sorted(pool)
 
+    # Gather unique space identifiers present in the design file
     spaces = set(str(x) for x in design_df[space_col].dropna().astype(str).tolist())
     pool = set()
     for s in spaces:
         if s in label_map:
             pool.update(label_map[s].values())
-    # If nothing matched (e.g., mismatched key formatting), fall back to all
+    # If nothing matched (e.g., formatting mismatch), fallback to all labels
     if not pool:
         for d in label_map.values():
             pool.update(d.values())
     return sorted(pool)
 
+
 def calculate_lengths(df):
-    """Calculates total duration for delayed vs immediate versions."""
+    """Return a human-readable total duration string for the design.
+
+    Uses 'trial_duration_max' when present for the delayed/maximum timing, and
+    approximates the immediate (no-isi2) total by subtracting isi2_dur contributions.
+    """
     total_delayed = df['trial_duration_max'].sum() if 'trial_duration_max' in df.columns else 0
     # Immediate mode removes the isi2_dur jitter
     total_immediate = total_delayed - df['isi2_dur'].sum() if 'isi2_dur' in df.columns else total_delayed
     return f"{total_delayed/60:.1f}m (Delayed) / {total_immediate/60:.1f}m (Immediate)"
 
+
 def scan_images(img_dir):
+    """Scan a directory for images and group them by leading "space" token.
+
+    The function expects filenames like: <space>_...ext and groups by the prefix
+    before the first underscore. It returns a mapping space_id -> [filepaths].
+    """
     files = os.listdir(img_dir)
     img_map = {}
     for f in files:
@@ -149,10 +172,12 @@ def scan_images(img_dir):
         img_map[group].append(os.path.join(img_dir, f))
     return img_map
 
+
 def get_trial_space_id(trial):
     """Return the stimulus 'space' identifier for the current trial.
 
-    Supports both legacy 'group' and newer 'ObjectSpace' design files.
+    Supports both legacy 'group' and newer 'ObjectSpace' design files. Raises
+    KeyError if neither column is present so callers can signal malformatted designs.
     """
     if 'ObjectSpace' in trial:
         return str(trial['ObjectSpace'])
@@ -162,13 +187,16 @@ def get_trial_space_id(trial):
         return str(trial['Group'])
     raise KeyError("Design CSV must contain either 'ObjectSpace' or 'group' column.")
 
-def resolve_image_path(img_dir, space_id, image_file):
-    """Resolve image path robustly.
 
-    Tries:
-      1) <img_dir>/<space_id>/<image_file>
-      2) <img_dir>/<image_file>
-      3) recursive search by basename under <img_dir> (first match)
+def resolve_image_path(img_dir, space_id, image_file):
+    """Resolve image path robustly across common directory layouts.
+
+    The function attempts three strategies in order:
+      1) Image stored in subfolder named after space_id: <img_dir>/<space_id>/<image_file>
+      2) Flat layout: <img_dir>/<image_file>
+      3) Recursive search under <img_dir> for the basename (returns first match)
+
+    Returning None indicates the image could not be located.
     """
     # 1) Subfolder layout
     p1 = os.path.join(img_dir, str(space_id), str(image_file))
@@ -184,24 +212,33 @@ def resolve_image_path(img_dir, space_id, image_file):
             if str(image_file) in files:
                 return os.path.join(root, str(image_file))
     except Exception:
+        # Ignore IO errors during recursive search; return None below
         pass
     return None
 
 # =========================== RUN HELPERS =========================== #
 
 def detect_run_column(design_df):
-    """Return the name of the run/block column if present, else None."""
+    """Return the name of the run/block column if present, else None.
+
+    Uses RUN_COL_CANDIDATES order to allow flexibility in input CSV formats.
+    """
     cols = set(design_df.columns)
     for c in RUN_COL_CANDIDATES:
         if c in cols:
             return c
     return None
 
+
 def split_into_runs(design_df, run_col):
-    """Split design_df into ordered runs (stable order of appearance)."""
+    """Split design_df into ordered runs (stable order of first appearance).
+
+    When run_col is None the whole design is considered a single run and a
+    list with (None, design_df) is returned to keep the calling code uniform.
+    """
     if run_col is None:
         return [(None, design_df)]
-    # Preserve order of appearance rather than sorting
+    # Preserve order of appearance rather than sorting values lexicographically
     run_values = []
     seen = set()
     for v in design_df[run_col].tolist():
@@ -210,8 +247,15 @@ def split_into_runs(design_df, run_col):
             run_values.append(v)
     return [(rv, design_df[design_df[run_col] == rv].copy()) for rv in run_values]
 
+
 def between_run_dialog(next_run_idx, run_label=None):
-    """Native GUI dialog shown between runs (outside fullscreen)."""
+    """Native GUI dialog shown between runs (outside fullscreen).
+
+    This dialog helps with multi-run experiments where the display must be
+    closed between runs (e.g., to allow scanner breaks or repositioning). It
+    also reminds the operator which run is about to begin and which trigger key
+    will start it.
+    """
     title = f"Start run {next_run_idx}"
     dlg = gui.Dlg(title=title)
     if run_label is not None:
@@ -223,10 +267,14 @@ def between_run_dialog(next_run_idx, run_label=None):
         core.quit()
 
 # =========================== VISUAL HELPERS =========================== #
+
 def show_instruction_screen(win, text_content, image_path=None):
     """
     Standardized instruction screen with optional image.
     Anchored to relative height units for cross-screen compatibility.
+
+    The function blocks until the participant presses the SPACE bar, and it
+    will attempt to display a large illustrative image if a valid path is given.
     """
     # Standardized vertical positions (relative to height 1.0)
     Y_INSTR_TEXT_HIGH = 0.22
@@ -252,14 +300,18 @@ def show_instruction_screen(win, text_content, image_path=None):
             img_stim.draw()
         cont_msg.draw()
         win.flip()
+        # Block until space pressed to ensure participant reads instructions
         if 'space' in event.getKeys():
             break
+
 
 def draw_buttons(buttons, selected_key):
     """Draw buttons during the Decision phase.
 
-    - Selected option is filled with white.
-    - Borders stay at normal thickness during decision.
+    Visual behaviour:
+      - The currently selected option (if any) is indicated by a white fill.
+      - Borders remain at normal thickness during the decision window.
+      - Button text is drawn twice to ensure readability across systems.
     """
     for btn in buttons:
         # Fill selected option with white
@@ -275,14 +327,16 @@ def draw_buttons(buttons, selected_key):
         btn['text'].draw()
         btn['text'].draw()
 
-def draw_buttons_feedback(buttons, response_made, correct_key):
-    """Draws buttons during Feedback phase.
 
-    Requirements:
-      - Highlight *edges* of the correct option in green (always).
-      - If participant selected incorrectly, also highlight the selected option edges in red.
-      - Make highlight thicker than normal edge thickness.
-      - Fill stays neutral for readability.
+def draw_buttons_feedback(buttons, response_made, correct_key):
+    """Draws buttons during Feedback phase and apply highlighting.
+
+    Behavioural requirements implemented here:
+      - Always highlight the correct option border in green to reveal the target.
+      - If the participant selected an incorrect option, highlight the selected
+        option border in red to indicate the error.
+      - Make the highlight thicker than the standard border for visibility.
+      - Fill remains neutral to keep label text readable.
     """
     for btn in buttons:
         btn['box'].fillColor = COL_NEUTRAL
@@ -302,12 +356,18 @@ def draw_buttons_feedback(buttons, response_made, correct_key):
         btn['box'].draw()
         btn['text'].draw()
 
+
 def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode):
     """Common setup logic for both timing modes.
 
-    - Supports 'ObjectSpace' or legacy 'group' in the design CSV.
-    - Resolves images robustly (subfolder or flat layouts).
-    - Samples 3 distractors from the *participant* label pool (restricted to ObjectSpaces in this design).
+    Responsibilities:
+      - Resolve and preload the trial image if present (will set main_image).
+      - Determine the target label and sample 3 distractors from the participant's pool.
+      - Shuffle choices and write them into the on-screen button text objects.
+      - Optionally set demo text showing the trial condition for experimenter debugging.
+
+    Returns:
+      (has_img, img_path, target_label, choices_list)
     """
     space_id = get_trial_space_id(trial)
     cond = str(trial['condition'])
@@ -318,17 +378,21 @@ def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode):
         components['main_image'].setImage(img_path)
         has_img = True
     else:
+        # Keep a best-guess path (may be used for logging) but mark as missing visually
         has_img = False
         img_path = img_path or os.path.join(img_dir, str(trial.get('image_file', '')))
 
     # 2) Labels
     label_map, all_labels = label_data
+    # target label is looked up by space and condition; missing mapping is explicit 'MISSING'
     target_lbl = label_map.get(space_id, {}).get(cond, "MISSING")
 
+    # Build distractor pool restricted to the participant's label set (precomputed)
     pool = [l for l in all_labels if l != target_lbl]
     if len(pool) >= 3:
         distractors = random.sample(pool, 3)
     else:
+        # If there are fewer than 3 alternatives, pad with 'NA' placeholders
         distractors = pool[:]
         while len(distractors) < 3:
             distractors.append("NA")
@@ -340,14 +404,19 @@ def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode):
     for i, btn in enumerate(components['buttons']):
         btn['text'].text = choices[i] if i < len(choices) else ""
 
-    # 3) Demo Text
+    # 3) Demo Text for live debugging / experimenter view
     if demo_mode:
         components['demo_text'].text = f"Condition:\n{cond}"
 
     return has_img, img_path, target_lbl, choices
 
+
 def check_response(components, clock, start_time):
-    """Checks keyboard (and mouse fallback)."""
+    """Poll for keyboard responses (primary) and mouse clicks (fallback).
+
+    Returns tuple (key, rt) where rt is relative to start_time. If no response
+    is detected returns (None, None). If EXIT_KEY is pressed, terminates experiment.
+    """
     keys = event.getKeys(keyList=KEYS_RESP + [EXIT_KEY], timeStamped=clock)
     if keys:
         k, t = keys[0]
@@ -355,14 +424,20 @@ def check_response(components, clock, start_time):
             core.quit()
         return k, t - start_time
 
+    # Mouse fallback: return the key associated with the clicked button if any
     if components['mouse'].getPressed()[0]:
         for btn in components['buttons']:
             if btn['box'].contains(components['mouse']):
                 return btn['key'], clock.getTime() - start_time
     return None, None
 
+
 def draw_extras(components, has_img, demo_mode):
-    """Helper to draw image/missing text and demo text."""
+    """Helper to draw trial image or 'missing' text and demo annotations.
+
+    Keeps calling code concise while centralising display behaviour for image
+    presence and demo annotations.
+    """
     if has_img:
         components['main_image'].draw()
     else:
@@ -371,12 +446,17 @@ def draw_extras(components, has_img, demo_mode):
     if demo_mode:
         components['demo_text'].draw()
 
+
 def _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials, clock, trial_t0,
                       phase_name, phase_end=None, breakdown_lines=None):
     """Update and draw demo HUD.
 
     Left: task timer + trial counter.
     Right: trial timer + current phase + per-event countdowns (approx).
+
+    This HUD is only active when demo_mode is True and is intended to help the
+    experimenter or developer observe scheduling progress. It should not affect
+    experiment timing since PsychoPy clocks control the actual flow.
     """
     if not demo_mode:
         return
@@ -402,14 +482,20 @@ def _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials, cl
     components['hud_left'].draw()
     components['hud_right'].draw()
 
+
 def _demo_skip_pressed(demo_mode):
     """Return True if the demo skip key was pressed (Demo Mode only)."""
     if not demo_mode:
         return False
     return bool(event.getKeys(keyList=[SKIP_KEY]))
 
+
 def _return_skipped(img_path):
-    """Standard result payload for a skipped trial."""
+    """Standard result payload for a skipped trial.
+
+    Used to produce a consistent row structure when demo skipping is used; the
+    'skipped' flag can be used downstream to filter demo trials from analysis.
+    """
     return {
         'response': None, 'rt': None,
         'target': None, 'correct_key': None,
@@ -422,7 +508,12 @@ def _return_skipped(img_path):
 
 def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_mode,
                        task_clock=None, trial_idx=1, n_trials=1):
-    """Restored 2-Event Logic with new visuals."""
+    """Restored 2-Event Logic with new visuals.
+
+    Standard mode timeline is absolute: onsets in the design CSV are respected
+    relative to a run clock. This function loops through phases using the
+    provided PsychoPy clock to maintain precise timing.
+    """
     has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode)
 
     # Identify correct key
@@ -432,6 +523,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
     except ValueError:
         correct_key = None
 
+    # Parse timing fields from the trial row (expected to exist in standard mode)
     t_dec_on  = float(trial['dec_onset'])
     t_dec_dur = float(trial['dec_dur'])
     t_fb_on   = float(trial['dec_fb_onset'])
@@ -440,7 +532,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
 
     trial_t0 = float(trial.get('trial_onset', clock.getTime()))
 
-    # Pre-Dec Fixation
+    # Pre-Dec Fixation: render fixation until decision onset
     while clock.getTime() < t_dec_on:
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
@@ -462,7 +554,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
                           clock, trial_t0, 'Fixation', t_dec_on, breakdown)
         win.flip()
 
-    # Decision
+    # Decision phase: collect keyboard/mouse responses while drawing choices
     components['mouse'].clickReset()
     event.clearEvents()
     response_made = None
@@ -493,7 +585,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
                           clock, trial_t0, 'Decision', (t_dec_on + t_dec_dur), breakdown)
         win.flip()
 
-    # Pre-Feedback Fixation
+    # Pre-Feedback Fixation: wait until feedback onset
     while clock.getTime() < t_fb_on:
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
@@ -514,7 +606,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
                           clock, trial_t0, 'Jitter', t_fb_on, breakdown)
         win.flip()
 
-    # Feedback
+    # Feedback: show correct/incorrect highlighting for the configured duration
     while clock.getTime() < (t_fb_on + t_fb_dur):
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
@@ -538,7 +630,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
                           clock, trial_t0, 'Feedback', (t_fb_on + t_fb_dur), breakdown)
         win.flip()
 
-    # ITI
+    # ITI: wait until trial end before returning results
     while clock.getTime() < t_end:
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
@@ -567,6 +659,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
         'skipped': 0
     }
 
+
 def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mode, feedback_delay,
                      task_clock=None, trial_idx=1, n_trials=1):
     """3-event (self-paced) trial.
@@ -577,6 +670,10 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
       - Optional hidden ISI2 delay (only if feedback_delay and responded)
       - Feedback
       - ITI (fixation)
+
+    The function implements a slightly more flexible flow than standard mode and
+    supports a self-paced decision phase where the trial advances immediately
+    after a response (useful for reaction-time based tasks).
     """
     has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode)
 
@@ -587,7 +684,7 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
     except ValueError:
         correct_key = None
 
-    # Durations (seconds)
+    # Durations (seconds) -- use fallbacks for compatibility with older design files
     img_dur = float(trial.get('img_dur', 0))
     isi1_dur = float(trial.get('isi1_dur', 0))
     max_dec_dur = float(trial.get('max_dec_dur', trial.get('dec_dur', 0)))
@@ -729,7 +826,13 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
 # =========================== WINDOW/COMPONENT FACTORY =========================== #
 
 def create_window_and_components(demo_mode):
-    """Create a fullscreen window and all visual components tied to it."""
+    """Create a fullscreen window and all visual components tied to it.
+
+    The window uses 'height' units which makes stimulus sizes expressed as
+    fractions of the screen height. This provides reasonable portability across
+    different screen resolutions. Components (TextStim/ImageStim/Rect) are
+    created here and returned in a dict for convenience.
+    """
     win = visual.Window([1280, 720], fullscr=True, color='white', units='height', allowGUI=False, useRetina=True)
 
     components = {
@@ -749,7 +852,7 @@ def create_window_and_components(demo_mode):
         'buttons': []
     }
 
-    # Setup Buttons
+    # Setup Buttons: create four rectangular buttons and centered labels
     spacing = 0.22
     start_x = -((3 * spacing) / 2)
     for i, key in enumerate(KEYS_RESP):
@@ -761,8 +864,14 @@ def create_window_and_components(demo_mode):
 
     return win, components
 
+
 def trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=1, run_label=None):
-    """Interactive trigger screen: waits for TRIGGER_KEY."""
+    """Interactive trigger screen: waits for TRIGGER_KEY.
+
+    Displays run/mode/demo information and allows the operator to press a
+    response key to visually check button mapping before the run begins. The
+    function blocks until TRIGGER_KEY is pressed or EXIT_KEY is used to abort.
+    """
     run_line = f"Run: {run_idx}/{n_runs}"
     if run_label is not None:
         run_line += f" (value: {run_label})"
@@ -793,6 +902,7 @@ def trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=1, run_la
         elif EXIT_KEY in pressed:
             core.quit()
 
+        # Visualise any pressed response key by temporarily filling the matching button
         hl_key = None
         for k in pressed:
             if k in KEYS_RESP:
@@ -812,7 +922,11 @@ def trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=1, run_la
 
 
 def _sanitize_run_label(label):
-    """Make a safe filename token from a run/block label."""
+    """Make a safe filename token from a run/block label.
+
+    Removes characters that may be problematic in filenames and truncates the
+    result to a reasonable length to avoid path issues on different OSes.
+    """
     if label is None:
         return "NA"
     s = str(label).strip()
@@ -822,8 +936,14 @@ def _sanitize_run_label(label):
     s = re.sub(r"[^A-Za-z0-9._-]+", "-", s)
     return s[:64]  # keep it short
 
+
 def _safe_write_csv(df, path):
-    """Write CSV atomically to reduce risk of corruption on crash."""
+    """Write CSV atomically to reduce risk of corruption on crash.
+
+    Writes to a temporary file then renames it into place which is an atomic
+    operation on most platforms and reduces the chance of partial files being
+    left behind if the process is terminated while writing.
+    """
     path = str(path)
     tmp = path + ".tmp"
     df.to_csv(tmp, index=False)
@@ -831,7 +951,7 @@ def _safe_write_csv(df, path):
 
 
 def run_experiment():
-    # 1. Start Dialog
+    # 1. Start Dialog: basic participant/run configuration
     info = {
         'Sub': '001',
         'Design CSV': '',        # Leave blank to browse
@@ -841,7 +961,7 @@ def run_experiment():
         'Demo Mode': False
     }
 
-    # Define a helper for browsing
+    # Define a helper for browsing (uses PsychoPy's GUI helpers)
     def browse_for_path(prompt, folder=False):
         if folder:
             path = gui.dirSelectDialog(prompt=prompt)
@@ -849,7 +969,7 @@ def run_experiment():
             path = gui.fileOpenDlg(prompt=prompt, allowed="CSV files (*.csv);;All files (*.*)")
         return path[0] if path else None
 
-    # Initial Setup GUI
+    # Initial Setup GUI: allow operator to edit defaults and choose files
     dlg = gui.DlgFromDict(
         info,
         title='Study 3 Launcher',
@@ -864,7 +984,7 @@ def run_experiment():
     if not dlg.OK:
         core.quit()
 
-    # 2. Trigger Browser for Empty Fields
+    # 2. Trigger Browser for Empty Fields: ensure all required paths are set
     if not info['Design CSV']:
         info['Design CSV'] = browse_for_path("Select Design CSV")
     if not info['Label CSV']:
@@ -875,15 +995,17 @@ def run_experiment():
         print(f"Warning: {info['Image Dir']} not found. Please select image directory.")
         info['Image Dir'] = browse_for_path("Select Image Directory", folder=True)
 
-    # 3. Final Validation
+    # 3. Final Validation: ensure required inputs were provided
     if not info['Design CSV'] or not info['Label CSV'] or not info['Image Dir']:
         print("Startup Error: Missing required file paths or directories.")
         core.quit()
 
-    demo_mode = bool(info['Demo Mode'])
-    feedback_delay = bool(info['Feedback Delay'])
+    # Convert boolean GUI results into native Python booleans
+    demo_mode = info['Demo Mode'] == 'True'
+    feedback_delay = info['Feedback Delay'] == 'True'
 
     try:
+        # Load design and label files and build participant-specific pools
         design_df = pd.read_csv(info['Design CSV'])
         print("design csv successfully loaded")
         label_map, _all_labels = load_label_map(info['Label CSV'], key_col='ObjectSpace')
@@ -892,7 +1014,7 @@ def run_experiment():
         print("label csv successfully loaded")
         _ = scan_images(info['Image Dir'])
 
-        # Determine mode based on design file columns
+        # Determine mode based on design file columns: presence of 'img_dur' indicates 3-event
         mode = '3event' if 'img_dur' in design_df.columns else 'standard'
         run_col = detect_run_column(design_df)
         runs = split_into_runs(design_df, run_col)
@@ -905,7 +1027,7 @@ def run_experiment():
         print(f"Startup Error during file loading: {e}")
         core.quit()
 
-    # Output rows (one per trial)
+    # Output rows (one per trial) will be accumulated and written per-run for crash safety
     out_rows = []
 
     n_runs = len(runs)
