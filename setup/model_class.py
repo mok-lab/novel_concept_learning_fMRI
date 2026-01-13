@@ -2,15 +2,57 @@
 """
 infer_final_robust_outlier.py
 
-The Definitive Pipeline (With Per-Model Outlier Scores).
-1. Metrics:
-   - Inter-Model Agreement & Intra-Model Consistency.
-   - Ensemble Consistency.
-   - Outlier Scoring (Distance from consensus for EACH model).
-2. Slices: Top-20, Mid (5+5 around Median), Bottom-20.
-3. Visualization: Images + Transparent Gaussian + Metrics Sidebar.
-"""
+Final analysis pipeline producing per-model and ensemble diagnostics
+for grouped image sets. The module:
 
+ - Runs model inference (probability vectors) and computes a weighted
+   ensemble probability per image.
+ - Computes three complementary metric classes to summarise behaviour
+   across a group of images:
+     1) Inter-Model Agreement
+     2) Intra-Model Consistency (per-model)
+     3) Ensemble Consistency
+ - Produces per-model outlier scores (L2 distance from the consensus)
+   and visualisations that place images in feature-space with metric sidebars.
+   
+Metric descriptions and interpretation:
+ - Inter-Model Agreement
+     Computed as the average pairwise Jaccard similarity of label "slices"
+     (Top / Mid / Bottom) between all pairs of models, measured per image
+     and averaged across the group. Range [0,1]. Higher values indicate
+     that models tend to nominate the same sets of labels for a given image
+     (strong agreement). Low values indicate disagreement or diverging top
+     label sets between models.
+
+ - Intra-Model Consistency
+     For each individual model we compute the average pairwise Jaccard
+     similarity of that model's label "slices" across the images within
+     the group. This measures whether a model is *stable* in the particular
+     slice across images (e.g., consistently returning a similar set of
+     top labels). Range [0,1]. A high intra-model consistency means the
+     model tends to produce similar slice-sets across the group's images;
+     a low value indicates the model's nominated labels vary a lot across
+     the group (potentially reflecting sensitivity to image differences).
+
+ - Ensemble Consistency
+     Same calculation as intra-model consistency but applied to the
+     ensemble (mean probability vector). This measures whether the ensemble
+     focuses on the same label sets across the group's images. High
+     ensemble consistency indicates the ensemble produces a stable focus;
+     low values indicate the ensemble's top/mid/bottom label sets change
+     substantially across images.
+
+ - Outlier Scores (Per-model)
+     For every image the Euclidean (L2) distance between each model's
+     probability vector and the consensus (mean) probability is computed.
+     These distances are then averaged across images (weighted by sample
+     weights) to give a per-model outlier score. Larger scores indicate
+     a model is systematically farther from the group consensus.
+
+Usage summary:
+ - Run on a folder of images (optionally recursive) with a list of model
+   names. Produces optional PNG visualisations and CSV summarising metrics.
+"""
 import argparse
 import csv
 import sys
@@ -42,7 +84,29 @@ except ImportError:
 # ==========================================
 
 def get_slice_indices(probs: torch.Tensor, slice_type: str, k: int) -> Set[int]:
-    """Returns set of indices for Top/Mid/Bot slices."""
+    """
+    Select a set of label indices corresponding to the requested 'slice'.
+
+    Parameters
+    - probs: 1D tensor of class probabilities for a single prediction.
+    - slice_type: 'top' | 'mid' | 'bot'
+      * 'top' -> indices of the top-k classes (highest probabilities).
+      * 'bot' -> indices of the bottom-k classes (lowest probabilities).
+      * 'mid' -> a mass-based median window: locate the index where the
+                 cumulative sorted probability mass crosses 0.5, then take
+                 a symmetric window (5+5) around that center. This is a
+                 fixed-width "middle" slice used for complementary analysis.
+    - k: requested number for top/bot. For 'mid' this parameter is ignored
+         in favour of the fixed 10-element window (5+5) implemented here.
+
+    Returns
+    - set of selected label indices (empty set if input invalid).
+
+    Notes:
+    - Returned indices are canonical label indices into the probability vector.
+    - The 'mid' strategy is intended to capture labels in the region around
+      the distribution's median mass (useful when the mass is spread).
+    """
     numel = probs.numel(); k = min(k, numel)
     sorted_vals, sorted_indices = torch.sort(probs, descending=True)
     
@@ -51,13 +115,13 @@ def get_slice_indices(probs: torch.Tensor, slice_type: str, k: int) -> Set[int]:
     elif slice_type == "bot":
         return set(sorted_indices[-k:].tolist())
     elif slice_type == "mid":
-        # Mass-based Median
+        # Mass-based Median: find first index where cumulative mass > 0.5
         cumsum = torch.cumsum(sorted_vals, dim=0)
         mass_indices = (cumsum > 0.5).nonzero(as_tuple=True)[0]
         center_idx = mass_indices[0].item() if len(mass_indices) > 0 else numel // 2
         
-        # Modified: 5+5 labels around the median (Radius 5)
-        # Note: This ignores 'k' and enforces a fixed window size of 10 centered on the median.
+        # Modified: 5+5 labels around the median (Radius 5).
+        # This enforces a fixed window size of up to 10 centered on median.
         start = max(0, center_idx - 5)
         end = min(numel, center_idx + 5)
         
@@ -65,7 +129,22 @@ def get_slice_indices(probs: torch.Tensor, slice_type: str, k: int) -> Set[int]:
     return set()
 
 def calculate_set_similarity(sets: List[Set[int]]) -> float:
-    """Average Pairwise Jaccard Similarity."""
+    """
+    Average pairwise Jaccard similarity across a list of sets.
+
+    Interpretation:
+      - Returns a scalar in [0,1].
+      - 1.0 => all sets are identical (perfect overlap).
+      - 0.0 => no overlap between any pairs.
+      - Used as a compact measure of agreement between nominative label
+        sets (top/mid/bot) either across models (inter-model) or across
+        images for a single model (intra-model).
+
+    Implementation details:
+      - Computes pairwise Jaccard (intersection / union) for all combinations
+        and returns the mean. If fewer than two sets are provided returns 1.0
+        (trivially identical).
+    """
     if len(sets) < 2: return 1.0
     scores = []
     for s1, s2 in itertools.combinations(sets, 2):
@@ -76,8 +155,20 @@ def calculate_set_similarity(sets: List[Set[int]]) -> float:
 
 def calculate_outlier_scores(prob_list: List[torch.Tensor], model_names: List[str]) -> Dict[str, float]:
     """
-    Calculates the Euclidean distance of EACH model from the group mean.
-    Returns a dict: {'resnet50': 0.12, 'inception': 0.45, ...}
+    Compute per-model L2 distance from the consensus (mean) probability vector.
+
+    Parameters:
+      - prob_list: list of 1D probability tensors (one per model) for a single image.
+      - model_names: list of model names corresponding to the probability tensors.
+
+    Returns:
+      - dict mapping model name -> L2 distance to consensus.
+
+    Interpretation:
+      - Larger distance => model's prediction distribution deviates more from the
+        group mean for that image (possible 'outlier' behaviour on that image).
+      - These per-image distances can be averaged across images to estimate
+        systematic deviation of a model relative to peers.
     """
     if len(prob_list) < 2: 
         return {name: 0.0 for name in model_names}
@@ -116,8 +207,7 @@ def parse_filename_features(path: Path) -> Tuple[str, Optional[float], Optional[
         try: return parts[0], float(parts[1]), float(parts[2])
         except: pass
     
-    # Handle "object1F0Level0.5F1Level0.8" format
-    # Matches digits/decimals following 'F0Level' and 'F1Level'
+    # Handle alternate naming convention "object1F0Level0.5F1Level0.8"
     f0_match = re.search(r'F0Level([-+]?\d*\.\d+|\d+)', stem)
     f1_match = re.search(r'F1Level([-+]?\d*\.\d+|\d+)', stem)
     
@@ -128,6 +218,14 @@ def parse_filename_features(path: Path) -> Tuple[str, Optional[float], Optional[
     return obj_name, f0, f1
 
 def compute_weight(f1, f2, tf1, tf2, sigma, uniform):
+    """
+    Compute a sample weight used to aggregate ensemble metrics.
+
+    - If `uniform` is True, every image with valid features receives weight 1.
+    - Otherwise returns a Gaussian-like weight based on distance between (f1,f2)
+      and target (tf1,tf2) with bandwidth sigma.
+    - If sigma <= 0 the weight is binary (1 if exact match, 0 otherwise).
+    """
     if uniform: return 1.0 if (f1 is not None) else 0.0
     if f1 is None: return 0.0
     dist_sq = (f1 - tf1)**2 + (f2 - tf2)**2
@@ -142,6 +240,10 @@ def format_k(values, indices, labels):
 # ==========================================
 
 def resolve_model_and_weights(model_name: str):
+    """
+    Resolve a torchvision model constructor and its default preprocessing transforms.
+    Handles newer `get_model` API and older constructors with `Weights` attribute.
+    """
     if hasattr(models, "get_model"):
         try:
             w = models.get_model_weights(model_name).DEFAULT
@@ -158,12 +260,19 @@ def resolve_model_and_weights(model_name: str):
 # ==========================================
 
 def get_stats_slices_mass_display(scores: torch.Tensor, k: int):
+    """
+    Helper to return top/mid/bot slices from an aggregated probability vector.
+
+    Returns:
+      - (top_vals, top_idx), (med_vals, med_idx), (bot_vals, bot_idx)
+    where each idx is an index tensor identifying the nominated labels.
+    """
     numel = scores.numel(); k = min(k, numel)
     sorted_vals, sorted_indices = torch.sort(scores, descending=True)
     top_vals, top_idx = sorted_vals[:k], sorted_indices[:k]
     bot_vals, bot_idx = sorted_vals[-k:], sorted_indices[-k:]
     
-    # Mid Logic
+    # Mid Logic: mass-based median window
     cumsum = torch.cumsum(sorted_vals, dim=0)
     mass_indices = (cumsum > 0.5).nonzero(as_tuple=True)[0]
     center_idx = mass_indices[0].item() if len(mass_indices) > 0 else numel // 2
@@ -177,6 +286,11 @@ def get_stats_slices_mass_display(scores: torch.Tensor, k: int):
 
 def generate_group_plot(group_id, items, target_f1, target_f2, sigma, uniform,
                         top_res, med_res, bot_res, metrics_str, outlier_str, output_dir):
+    """
+    Optional plotting utility that lays out item thumbnails in feature
+    coordinates (f1,f2) and displays the computed metric summary in a
+    sidebar for quick manual inspection.
+    """
     if not VIZ_AVAILABLE: return
     fig, ax = plt.subplots(figsize=(18, 12))
     ax.set_xlim(-0.1, 1.1); ax.set_ylim(-0.1, 1.1)
@@ -221,7 +335,35 @@ def generate_group_plot(group_id, items, target_f1, target_f2, sigma, uniform,
 # ==========================================
 
 def aggregate_group_metrics(items, model_names, top_k):
-    """Calculates metrics including per-model breakdowns and outlier scores."""
+    """
+    Compute group-level aggregated metrics and per-model outlier scores.
+
+    Inputs:
+      - items: list of dicts containing keys:
+          'individual_probs' -> list of tensors (one per model) with class probabilities
+          'ensemble_probs'   -> tensor with ensemble (mean) probability vector
+          'weight'           -> scalar weight for the image
+      - model_names: list of model name strings
+      - top_k: integer used to select top/bottom slices
+
+    Outputs:
+      - agg_prob: aggregated (weighted) probability vector across images (torch.Tensor)
+      - eff: effective sample size computed from the sample weights (float)
+      - metrics: dict with keys for each slice in ['top','mid','bot'] containing:
+          * {slice}_model_agree     : Inter-model agreement averaged across images (Jaccard)
+          * {slice}_outlier_{model} : Average L2 outlier score for each model (averaged across items)
+          * {slice}_const_{model}   : Intra-model consistency for each model (Jaccard across images)
+          * {slice}_model_const_AVG : Average intra-model consistency (mean across models)
+          * {slice}_ens_const       : Ensemble consistency across images (Jaccard)
+
+    Notes on interpretation:
+      - 'eff' (effective sample size) is computed from the weights via (sum_w^2 / sum_sq_w).
+        It reflects how many equally-weighted samples the weighted set is equivalent to.
+        If weights are uniform eff ~= N, otherwise eff is smaller.
+      - Agreement/consistency metrics are Jaccard means in [0,1]: higher is more agreement/stability.
+      - Outlier scores are distances in probability-space; compare magnitudes across models to
+        identify models that consistently deviate from the consensus.
+    """
     model_count = len(model_names)
     
     # 1. Weighted Ensemble Probability
@@ -244,21 +386,23 @@ def aggregate_group_metrics(items, model_names, top_k):
     
     for sl in ['top', 'mid', 'bot']:
         # A. Inter-Model Agreement (Avg across images)
+        #    For each image we compute label-sets for all models and take the
+        #    average pairwise Jaccard similarity; these image-level agreements
+        #    are then averaged across the group (weighted).
         img_agrees = []
-        # Store outlier scores per image, then we average them
-        # Structure: list of dicts [{'resnet': 0.1, 'inc': 0.2}, ...]
+        # Store per-image per-model outlier scores so we can aggregate them
         img_outliers = []
         
         for item in items:
-            # Jaccard
+            # Jaccard: agreement between models on this image's slice
             sets = [get_slice_indices(p, sl, top_k) for p in item['individual_probs']]
             img_agrees.append(calculate_set_similarity(sets))
             
-            # Outlier Score (Distance) for this image
+            # Outlier Score: L2 distance from consensus for each model on this image
             scores = calculate_outlier_scores(item['individual_probs'], model_names)
             img_outliers.append(scores)
         
-        # Weighted Aggregations
+        # Weighted Aggregations: average image-level agreement using sample weights
         metrics[f"{sl}_model_agree"] = np.average(img_agrees, weights=weights) if sum_w > 0 else 0.0
 
         # Aggregate Outlier Scores (Average distance per model across the group)
@@ -268,6 +412,8 @@ def aggregate_group_metrics(items, model_names, top_k):
             metrics[f"{sl}_outlier_{m_name}"] = avg_score
 
         # B. Intra-Model Consistency (Per Model)
+        #    For each model we look across images and measure how similar that
+        #    model's nominated slice-sets are across the group's images.
         mod_const_scores = []
         for m_idx, m_name in enumerate(model_names):
             m_probs = [item['individual_probs'][m_idx] for item in items]
@@ -276,9 +422,10 @@ def aggregate_group_metrics(items, model_names, top_k):
             metrics[f"{sl}_const_{m_name}"] = val
             mod_const_scores.append(val)
         
+        # Average intra-model consistency across models
         metrics[f"{sl}_model_const_AVG"] = sum(mod_const_scores) / len(mod_const_scores)
 
-        # C. Ensemble Consistency
+        # C. Ensemble Consistency: how stable is the ensemble's slice across images?
         ens_probs = [item['ensemble_probs'] for item in items]
         ens_sets = [get_slice_indices(p, sl, top_k) for p in ens_probs]
         metrics[f"{sl}_ens_const"] = calculate_set_similarity(ens_sets)
