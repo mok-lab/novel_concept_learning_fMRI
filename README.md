@@ -1,6 +1,6 @@
 ﻿# Novel Concept Learning fMRI Task
 
-This repository contains the PsychoPy implementation for a "Novel Concept Learning" fMRI study. The experiment is designed to investigate how participants learn and categorize novel objects (depicted as alien items or planetary artifacts) across different learning conditions.
+This repository contains the PsychoPy implementation for a "Novel Concept Learning" fMRI study. The experiment is designed to investigate how participants learn and categorize novel objects across different learning conditions.
 
 ## Overview
 
