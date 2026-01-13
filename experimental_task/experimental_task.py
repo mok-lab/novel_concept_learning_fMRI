@@ -956,7 +956,7 @@ def run_experiment():
         'Sub': '001',
         'Design CSV': '',        # Leave blank to browse
         'Label CSV': '',         # Leave blank to browse
-        'Image Dir': 'blender_output_renamed',   # Default directory
+        'Image Dir': 'images/task_images/',   # Default directory
         'Feedback Delay': False, # Selection from previous requirements
         'Demo Mode': False
     }
