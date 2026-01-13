@@ -89,4 +89,4 @@ def run_renamer(source_folder, output_folder):
 
 if __name__ == "__main__":
     # Use
-    run_renamer("blender_output/", "blender_output_renamed/")
+    run_renamer("images/raw_images", "images/task_images")

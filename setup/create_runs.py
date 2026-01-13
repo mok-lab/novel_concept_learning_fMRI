@@ -129,7 +129,7 @@ class DesignConfig:
     start_time: float
     n_categories_to_select: int
     label_csv_path: str
-    stim_dir: str = "blender_output_renamed"
+    stim_dir: str = "images/task_images/"
     # Test run configuration
     include_test_run: bool = False
     n_test_runs: int = 1

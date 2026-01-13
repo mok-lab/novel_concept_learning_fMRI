@@ -95,7 +95,7 @@ def run_sampling_test():
     # Save a preview and show the plot.
     # The saved PNG is useful when running in environments where interactive
     # display is not available.
-    output_name = f"sampling_test_{os.path.basename(file_path)}.png"
+    output_name = f"checks/plots/sampling_test_{os.path.basename(file_path)}.png"
     plt.savefig(output_name)
     print(f"Plot saved as: {output_name}")
     plt.show()

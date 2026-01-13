@@ -64,8 +64,8 @@ Y_BUTTON_LABELS   = -0.38
 
 # =========================== CONFIGURATION =========================== #
 # Paths and small practice design used by the script.
-PRACTICE_IMG_DIR = "practice_images"
-PRACTICE_LABEL_CSV = "practice_labels.csv"
+PRACTICE_IMG_DIR = "images/practice_images"
+PRACTICE_LABEL_CSV = "experimental_task/label_files/practice_labels.csv"
 
 # Short practice design demonstrating slow/fast and repeat behaviours.
 # Each dictionary represents one trial template (ObjectSpace used to resolve image and label).

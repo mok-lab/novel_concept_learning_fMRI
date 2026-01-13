@@ -53,7 +53,7 @@ def main():
     # --- SIDEBAR GUI ---
     st.sidebar.header("Path Settings")
     parent_dir = st.sidebar.text_input("Parent Stimuli Directory", "renamed_images")
-    label_csv = st.sidebar.text_input("Label CSV Path", "full_results_v1.csv")
+    label_csv = st.sidebar.text_input("Label CSV Path", "setup/output/full_results_v1.csv")
 
     if not os.path.exists(label_csv):
         st.error(f"Label file not found: {label_csv}")

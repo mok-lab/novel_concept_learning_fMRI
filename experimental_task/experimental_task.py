@@ -1098,15 +1098,15 @@ while others will not. \n\nThe names of the objects won't change during the expe
         if len(run_rows) > 0:
             run_out_df = pd.DataFrame(run_rows)
             run_token = _sanitize_run_label(run_label)
-            run_path = f"data/sub-{info['Sub']}_{mode}_run-{run_idx:02d}_{run_token}.csv"
+            run_path = f"participant_data/sub-{info['Sub']}_{mode}_run-{run_idx:02d}_{run_token}.csv"
             _safe_write_csv(run_out_df, run_path)
 
     out_df = pd.DataFrame(out_rows)
     # Final joined file across all runs (crash-safe)
-    joined_path = f"data/sub-{info['Sub']}_{mode}_joined.csv"
+    joined_path = f"participant_data/sub-{info['Sub']}_{mode}_joined.csv"
     _safe_write_csv(out_df, joined_path)
     # Also write/keep the legacy filename for compatibility
-    legacy_path = f"data/sub-{info['Sub']}_{mode}.csv"
+    legacy_path = f"participant_data/sub-{info['Sub']}_{mode}.csv"
     _safe_write_csv(out_df, legacy_path)
 
     try:
