@@ -159,7 +159,7 @@ def load_and_parse_groups(csv_path):
 
     Returns a pandas DataFrame where the 'ObjectSpace' column is kept as string.
     """
-    df = pd.read_csv(csv_path, sep=None, dtype={'ObjectSpace': str}, engine="python")
+    df = pd.read_csv(csv_path, sep=",", dtype={'ObjectSpace': str}, engine="python")
     # Trim whitespace from column names to reduce common CSV formatting issues
     df.columns = [c.strip() for c in df.columns]
     return df
