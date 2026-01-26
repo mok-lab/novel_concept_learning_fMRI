@@ -82,7 +82,7 @@ def load_label_map(csv_path, key_col='ObjectSpace'):
       - Uses pandas with engine='python' to allow flexible CSV separators when needed.
       - Raises ValueError if expected columns are missing so the caller can fail fast.
     """
-    df = pd.read_csv(csv_path, sep=None, dtype={key_col: str}, engine="python")
+    df = pd.read_csv(csv_path, sep=",", dtype={key_col: str}, engine="python")
     required = {key_col, 'Congruent', 'Medium', 'Incongruent'}
     missing = required - set(df.columns)
     if missing:
@@ -1033,7 +1033,7 @@ def run_experiment():
     n_runs = len(runs)
 
     # Ensure output directory exists early so per-run files can be written safely
-    os.makedirs('data', exist_ok=True)
+    os.makedirs('participant_data', exist_ok=True)
 
     # Create first fullscreen window and start as-is (run 1 unchanged)
     win, components = create_window_and_components(demo_mode)
