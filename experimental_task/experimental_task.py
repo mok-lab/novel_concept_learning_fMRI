@@ -1000,9 +1000,17 @@ def run_experiment():
         print("Startup Error: Missing required file paths or directories.")
         core.quit()
 
-    # Convert boolean GUI results into native Python booleans
-    demo_mode = info['Demo Mode'] == 'True'
-    feedback_delay = info['Feedback Delay'] == 'True'
+    # Convert GUI values to booleans robustly (handles both booleans and strings)
+    def _to_bool(val):
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return False
+        s = str(val).strip().lower()
+        return s in ('1', 'true', 't', 'yes', 'y', 'on')
+
+    demo_mode = _to_bool(info.get('Demo Mode'))
+    feedback_delay = _to_bool(info.get('Feedback Delay'))
 
     try:
         # Load design and label files and build participant-specific pools
