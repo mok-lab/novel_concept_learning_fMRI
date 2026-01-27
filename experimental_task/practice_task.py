@@ -31,7 +31,7 @@ import os
 
 # Import core loaders and logic from demo_task.py so visual behaviour stays consistent.
 # demo_task provides the window factory, stimulus setup and common drawing/response helpers.
-from demo_task import (
+from experimental_task import (
     create_window_and_components, 
     setup_trial_visuals, 
     load_label_map, 
