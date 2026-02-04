@@ -37,6 +37,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import hashlib
+import json
+import pickle
 from pathlib import Path
 from typing import Dict, Tuple
 from tqdm import tqdm
@@ -144,7 +147,7 @@ def convolve_to_TR(stim, TR, tres, n_scans, hrf_type='double_gamma'):
         tr_duration=TR,
         temporal_resolution=tres,
         scale_function=False,
-        hrf_library=hrf_vector
+        # hrf_type=hrf_vector # Use standard canonical (default)
     )
 
     n_tp_run = sig.shape[0]
@@ -153,9 +156,47 @@ def convolve_to_TR(stim, TR, tres, n_scans, hrf_type='double_gamma'):
     return np.interp(t_tr, t_high, sig[:, 0])
 
 
-def generate_noise_volume(noise_dict: Dict, mask3d: np.ndarray, n_scans: int) -> np.ndarray:
-    dims = (*mask3d.shape, n_scans)
-    return fmrisim.generate_noise(dimensions=dims, stimfunction=None, mask=mask3d, noise_dict=noise_dict)
+def generate_noise_volume(noise_dict: Dict, mask3d: np.ndarray, template3d: np.ndarray, n_scans: int, TR: float) -> np.ndarray:
+    """Generate 4D noise using the *documented* BrainIAK fmrisim API.
+
+    The BrainIAK fmrisim multivariate example uses:
+        generate_noise(dimensions=dim[0:3], stimfunction_tr=[0]*dim[3], tr_duration=int(tr), ...)
+
+    For non-integer TR (e.g., 1.792s) some fmrisim versions accept float TR; we pass TR as float.
+    """
+    # Prefer the documented API used in the BrainIAK fmrisim multivariate example.
+    # Different fmrisim/BrainIAK versions vary slightly in accepted kwargs, so:
+    #   1) Try the doc-style call (dimensions=3D, stimfunction_tr, tr_duration)
+    #   2) If that fails, fall back to a signature-filtered call.
+    stimfunction_tr = [0] * int(n_scans)
+
+    try:
+        return fmrisim.generate_noise(
+            dimensions=list(mask3d.shape),
+            stimfunction_tr=stimfunction_tr,
+            tr_duration=float(TR),
+            mask=mask3d,
+            template=template3d,
+            noise_dict=noise_dict,
+        )
+    except TypeError:
+        # Fallback: filter kwargs to what the installed version supports.
+        import inspect
+        kwargs = dict(
+            dimensions=list(mask3d.shape),
+            stimfunction_tr=stimfunction_tr,
+            tr_duration=float(TR),
+            mask=mask3d,
+            template=template3d,
+            noise_dict=noise_dict,
+        )
+        try:
+            sig = inspect.signature(fmrisim.generate_noise)
+            accepted = set(sig.parameters.keys())
+            kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        except Exception:
+            pass
+        return fmrisim.generate_noise(**kwargs)
 
 
 # ------------------------
@@ -268,6 +309,137 @@ def roi_mask_target_voxels(shape3d: Tuple[int,int,int],
     return best, radius
 
 
+
+# ------------------------
+# Noise caching + doc-style pipeline (BrainIAK example)
+# ------------------------
+def _stable_hash(obj) -> str:
+    s = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(s).hexdigest()[:12]
+
+def load_or_make_noise_dict(vol4d: np.ndarray, noise_nii_path: str, TR: float, cache_dir: Path, use_cache: bool) -> Tuple[dict, np.ndarray, np.ndarray]:
+    """
+    Follow the BrainIAK fmrisim multivariate example as closely as possible:
+      mask, template = fmrisim.mask_brain(volume=volume, mask_self=True)
+      noise_dict = fmrisim.calc_noise(volume=volume, mask=mask, template=template, noise_dict=None)
+
+    Returns (noise_dict, brain_mask, template).
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # mask + template per docs
+    brain_mask, template = fmrisim.mask_brain(volume=vol4d, mask_self=True)
+
+    # Build a cache key that changes if the underlying NIfTI changes
+    try:
+        st = Path(noise_nii_path).stat()
+        nii_fingerprint = {"path": str(Path(noise_nii_path).resolve()), "size": st.st_size, "mtime": int(st.st_mtime)}
+    except Exception:
+        nii_fingerprint = {"path": str(noise_nii_path)}
+
+    key = _stable_hash({
+        "nii": nii_fingerprint,
+        "TR": float(TR),
+        "mask_self": True,
+        "shape": tuple(vol4d.shape),
+        "fmrisim": getattr(fmrisim, "__file__", "unknown"),
+    })
+    pkl_path = cache_dir / f"noise_dict_{key}.pkl"
+
+    if use_cache and pkl_path.exists():
+        with open(pkl_path, "rb") as f:
+            noise_dict = pickle.load(f)
+        return noise_dict, brain_mask.astype(np.uint8), template.astype(np.float32)
+
+    noise_dict = fmrisim.calc_noise(volume=vol4d, mask=brain_mask, template=template, noise_dict=None)
+
+    if use_cache:
+        with open(pkl_path, "wb") as f:
+            pickle.dump(noise_dict, f)
+
+    return noise_dict, brain_mask.astype(np.uint8), template.astype(np.float32)
+
+def load_or_make_run_noise_2d_doc(
+    run_id,
+    n_scans: int,
+    TR: float,
+    noise_dict: dict,
+    brain_mask: np.ndarray,
+    template: np.ndarray,
+    roi_mask: np.ndarray,
+    n_vox: int,
+    cache_dir: Path,
+    use_cache: bool,
+    noise_cache_seed: int,
+) -> np.ndarray:
+    """
+    Generate noise using the documented BrainIAK example call:
+        noise = fmrisim.generate_noise(dimensions=dim[0:3],
+                                      stimfunction_tr=[0]*dim[3],
+                                      tr_duration=tr,
+                                      mask=mask,
+                                      template=template,
+                                      noise_dict=noise_dict)
+
+    Then sample *n_vox* voxels from roi_mask and return a (T x n_vox) matrix.
+
+    We cache the sampled (T x n_vox) noise per run.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    rid_int = int(run_id) if str(run_id).isdigit() else (hash(str(run_id)) & 0xFFFFFFFF)
+    key = _stable_hash({
+        "rid": str(run_id),
+        "rid_int": rid_int,
+        "n_scans": int(n_scans),
+        "TR": float(TR),
+        "n_vox": int(n_vox),
+        "noise_cache_seed": int(noise_cache_seed),
+        "roi_vox": int(np.sum(roi_mask > 0)),
+        "brain_vox": int(np.sum(brain_mask > 0)),
+    })
+    npz_path = cache_dir / f"runnoise_{key}.npz"
+
+    if use_cache and npz_path.exists():
+        dat = np.load(npz_path)
+        noise_2d = dat["noise_2d"].astype(np.float32)
+        if noise_2d.shape != (n_scans, n_vox):
+            raise ValueError(f"Cached run noise has shape {noise_2d.shape} but expected {(n_scans, n_vox)}.")
+        return noise_2d
+
+    # Whole-brain noise generation per docs
+    stimfunction_tr = [0] * int(n_scans)
+    noise_4d = fmrisim.generate_noise(
+        dimensions=list(brain_mask.shape),
+        stimfunction_tr=stimfunction_tr,
+        tr_duration=float(TR),   # docs cast to int for TR=2; float is necessary for TR=1.792
+        mask=brain_mask,
+        template=template,
+        noise_dict=noise_dict,
+    )
+
+    # Sample ROI voxels deterministically (for caching / optimisation stability)
+    roi_bool = (roi_mask > 0) & (brain_mask > 0)
+    roi_lin = np.flatnonzero(roi_bool.reshape(-1))
+    if roi_lin.size < n_vox:
+        raise ValueError(f"ROI has {roi_lin.size} voxels inside brain_mask but n_vox={n_vox} requested.")
+    rng = np.random.default_rng(int(noise_cache_seed) + int(rid_int))
+    pick_lin = rng.choice(roi_lin, size=n_vox, replace=False)
+
+    noise_2d = noise_4d.reshape(-1, n_scans)[pick_lin].T.astype(np.float32)
+
+    if use_cache:
+        np.savez_compressed(npz_path, noise_2d=noise_2d)
+
+    return noise_2d
+
+def compute_n_scans_for_run(df_run: pd.DataFrame, TR: float, pad_s: float, dec_dur_s: float) -> int:
+    dec_on = df_run["dec_onset_est"].to_numpy(float)
+    fb_on = dec_on + float(dec_dur_s) + df_run["isi2_dur"].to_numpy(float)
+    fb_dur = df_run["fb_dur"].to_numpy(float)
+    total_time_s = float(np.max(fb_on + fb_dur)) + float(pad_s)
+    return int(math.ceil(total_time_s / float(TR)))
+
 # ------------------------
 # 3-event trial-wise regressors
 # ------------------------
@@ -342,8 +514,7 @@ def simulate_one_run(df_run: pd.DataFrame,
                      dec_dur_s: float,
                      tres: float,
                      hrf_type_sim: str,
-                     noise_dict: dict,
-                     roi_mask: np.ndarray,
+                     noise_2d: np.ndarray,
                      n_vox: int,
                      rng: np.random.Generator,
                      decision_mix: float,
@@ -365,29 +536,14 @@ def simulate_one_run(df_run: pd.DataFrame,
     # 3. Generate Signal
     Y_sig = (X_enc @ P_enc) + (X_dec @ P_dec) + (X_fb @ P_fb)
     Y_sig = apply_voxel_latency_shift(Y_sig, TR, rng, hrf_latency_mismatch_sd)
-
-    # 4. Generate Noise (Optimized)
-    roi_slices = roi_mask_bbox(roi_mask)
-    roi_mask_sub = roi_mask[roi_slices]
-    spatial_dims = list(roi_mask_sub.shape)
-
-    noise_vol_4d = fmrisim.generate_noise(
-        dimensions=spatial_dims + [n_scans],
-        stimfunction=None,
-        tr_duration=TR,
-        temporal_resolution=tres,
-        noise_dict=noise_dict,
-        mask=roi_mask_sub,
-        template=None
-    )
-
-    # 5. Extract ROI Voxels
-    roi_indices = np.where(roi_mask_sub.reshape(-1) > 0)[0]
-    if roi_indices.size < n_vox:
-        raise ValueError(f"ROI mask has {roi_indices.size} voxels < n_vox={n_vox}. Increase ROI size or lower n_vox.")
-    pick = rng.choice(roi_indices, size=n_vox, replace=False)
-
-    noise_2d = noise_vol_4d.reshape(-1, n_scans)[pick].T
+    # 4. Noise (doc-style pipeline)
+    # Noise is generated outside this function using the BrainIAK example pipeline
+    # (mask_brain -> calc_noise -> generate_noise), then we sample n_vox voxels from the ROI
+    # and pass a (T x n_vox) matrix in here.
+    if noise_2d.shape[0] != n_scans:
+        raise ValueError(f"noise_2d has {noise_2d.shape[0]} timepoints but design has n_scans={n_scans}.")
+    if noise_2d.shape[1] != n_vox:
+        raise ValueError(f"noise_2d has {noise_2d.shape[1]} voxels but n_vox={n_vox}.")
 
     Y = Y_sig + noise_2d
 
@@ -470,7 +626,25 @@ def main():
     ap.add_argument("--brainmask_frac", type=float, default=0.2, help="Threshold fraction for auto brain mask.")
     ap.add_argument("--write_roi_mask", action="store_true", help="Write ROI mask NIfTI alongside outputs.")
     ap.add_argument("--out_dir", default="fmrisim_cornet_loc_out")
+    ap.add_argument("--cache_noise_dict", action="store_true",
+                help="Cache the fmrisim noise_dict (from calc_noise) to disk so subsequent runs load it.")
+    ap.add_argument("--cache_run_noise", action="store_true",
+                help="Cache the sampled ROI noise (T x n_vox) per run to disk so subsequent runs load it.")
+    ap.add_argument("--noise_cache_seed", type=int, default=0,
+                help="Seed used for deterministic voxel sampling when caching run noise.")
+    ap.add_argument("--noise_cache_dir", default=None,
+                help="Optional directory for noise cache. Default: <out_dir>/noise_cache")
+
+    # Backwards-compatible / deprecated args (ignored in this doc-faithful pipeline)
+    ap.add_argument("--noise_mask", default=None,
+                    help="DEPRECATED/IGNORED. This script now estimates noise from the whole-brain mask per BrainIAK docs.")
+    ap.add_argument("--noise_roi_scale", type=float, default=None,
+                    help="DEPRECATED/IGNORED. Noise is generated from whole-brain per BrainIAK docs.")
     args = ap.parse_args()
+
+    if args.noise_mask is not None or args.noise_roi_scale is not None:
+        print("[fmrisim_run] NOTE: --noise_mask/--noise_roi_scale are ignored. "
+              "This script follows the BrainIAK fmrisim example pipeline: estimate noise on whole brain, then generate noise.")
 
     # Load design and enforce ordering consistent with CORnet pattern generation
     df = pd.read_csv(args.csv)
@@ -482,8 +656,17 @@ def main():
     # Load patterns
     patterns = np.load(args.patterns_npz, allow_pickle=True)
     P_all = patterns["patterns_enc_200"].astype(np.float32)
-    if P_all.shape[1] != args.n_vox:
-        raise ValueError(f"patterns_enc_200 has {P_all.shape[1]} dims, expected n_vox={args.n_vox}")
+    # Allow simulating fewer voxels than exist in patterns (e.g., if your sampled ROI has fewer voxels).
+    # We deterministically take the first n_vox columns to keep alignment stable.
+    if args.n_vox > P_all.shape[1]:
+        raise ValueError(
+            f"--n_vox={args.n_vox} but patterns_enc_200 has only {P_all.shape[1]} columns. "
+            "Either regenerate patterns with at least n_vox columns, or reduce --n_vox."
+        )
+    if args.n_vox < P_all.shape[1]:
+        print(f"[fmrisim_run] NOTE: patterns_enc_200 has {P_all.shape[1]} columns but --n_vox={args.n_vox}. "
+              "Using the first --n_vox columns of the patterns for simulation.")
+        P_all = P_all[:, :args.n_vox]
     if len(df) != P_all.shape[0]:
         raise ValueError(f"CSV has {len(df)} rows but patterns have {P_all.shape[0]} rows. "
                          "Regenerate patterns from the same CSV/order, or align explicitly.")
@@ -493,13 +676,18 @@ def main():
     vol4d = noise_img.get_fdata().astype(np.float32)
     aff = noise_img.affine
     shape3d = vol4d.shape[:3]
+    # Noise model estimation and caching (doc-style pipeline)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.noise_cache_dir) if args.noise_cache_dir else (out_dir / "noise_cache")
 
-    # Auto brain mask for noise model + noise generation
-    brain_mask = auto_brain_mask_from_4d(vol4d, frac=args.brainmask_frac)
-
-    # Estimate noise model on the real data (within brain mask)
-    template = brain_mask.astype(np.float32)
-    noise_dict = fmrisim.calc_noise(volume=vol4d, mask=brain_mask, template=template, noise_dict=None)
+    noise_dict, brain_mask, template = load_or_make_noise_dict(
+        vol4d=vol4d,
+        noise_nii_path=str(args.noise_nii),
+        TR=args.TR,
+        cache_dir=cache_dir,
+        use_cache=bool(args.cache_noise_dict),
+    )
 
     # Build LOC ROI mask in this space
     if args.loc_space == "mni":
@@ -530,8 +718,6 @@ def main():
         raise RuntimeError(f"LOC ROI has only {n_roi} voxels but you requested n_vox={args.n_vox}. "
                            "Increase --roi_target_vox or --roi_r0_mm.")
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.write_roi_mask:
         roi_img = nib.Nifti1Image(roi_mask.astype(np.uint8), aff)
@@ -545,6 +731,25 @@ def main():
         n = int((df["run_id"] == rid).sum())
         run_slices[rid] = slice(idx0, idx0 + n)
         idx0 += n
+
+    # Pre-generate / cache run-specific ROI noise (T x n_vox) so we don't regenerate noise every rep
+    cached_run_noise: Dict = {}
+    for rid in run_ids:
+        df_run = df[df["run_id"] == rid].copy()
+        n_scans_r = compute_n_scans_for_run(df_run, TR=args.TR, pad_s=args.pad_s, dec_dur_s=args.dec_dur_s)
+        cached_run_noise[rid] = load_or_make_run_noise_2d_doc(
+            run_id=rid,
+            n_scans=n_scans_r,
+            TR=args.TR,
+            noise_dict=noise_dict,
+            brain_mask=brain_mask,
+            template=template,
+            roi_mask=roi_mask,
+            n_vox=args.n_vox,
+            cache_dir=cache_dir,
+            use_cache=bool(args.cache_run_noise),
+            noise_cache_seed=int(args.noise_cache_seed),
+        )
 
     rng_master = np.random.default_rng(args.seed)
     rows = []
@@ -564,8 +769,7 @@ def main():
                 dec_dur_s=args.dec_dur_s,
                 tres=args.temporal_resolution,
                 hrf_type_sim="double_gamma",
-                noise_dict=noise_dict,
-                roi_mask=roi_mask,
+                noise_2d=cached_run_noise[rid],
                 n_vox=args.n_vox,
                 rng=rng,
                 decision_mix=args.decision_mix,
