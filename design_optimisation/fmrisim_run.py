@@ -151,45 +151,37 @@ def auto_crop_data(nifti_data, x_pct=0.80, y_pct=0.15, z_pct=0.35, crop_size=30)
 
 def convolve_to_TR(stim, TR, tres, hrf_type='double_gamma'):
     """
-    Convolve high-res stimulation vector to TR resolution.
-    Returns 1D array of length n_TRs.
+    Convolves high-res stimulation vector to TR resolution using numpy.
+    Bypasses brainiak.fmrisim.convolve_hrf to fix TypeError and dimension errors.
     """
-    # Force stim to be 2D (time x conditions) for brainiak requirements
-    if stim.ndim == 1:
-        stim = stim.reshape(-1, 1)
-
-    # --- FIX START: Generate HRF manually as 1D array ---
-    # We ignore the 'hrf_type' string and use our robust function
-    # to prevent "object too deep" errors in np.convolve
+    # 1. Get HRF (using our manual helper or pass-through)
     if isinstance(hrf_type, str):
-        hrf_vector = get_double_gamma_hrf(temporal_resolution=tres)
+        hrf = get_double_gamma_hrf(tres)
     else:
-        # If a vector was passed directly, use it
-        hrf_vector = hrf_type
+        hrf = hrf_type
+    
+    # 2. Flatten inputs (Fixes "object too deep" error)
+    if hrf.ndim > 1: hrf = hrf.flatten()
+    if stim.ndim > 1: stim = stim.flatten()
         
-    # Double check it is 1D (Critical for numpy < 1.18 compatibility)
-    if hasattr(hrf_vector, 'flatten'):
-        hrf_vector = hrf_vector.flatten()
-    # --- FIX END ----------------------------------------
+    # 3. Convolve (Full mode to get the tail)
+    convolved = np.convolve(stim, hrf, mode='full')
+    
+    # 4. Downsample to TR resolution
+    # Calculate step size in samples
+    step = int(TR * tres)
+    
+    # Indices: 0, 1*step, 2*step...
+    # We slice to match the length of the simulation run
+    n_expected_trs = int(len(stim) / step)
+    idx = np.arange(0, len(convolved), step)
+    
+    # Truncate to match run length
+    if len(idx) > n_expected_trs:
+        idx = idx[:n_expected_trs]
+        
+    return convolved[idx]
 
-    # Call fmrisim with the explicit 1D HRF vector
-    sig = fmrisim.convolve_hrf(
-        stimfunction=stim,
-        tr_duration=TR,
-        temporal_resolution=tres,
-        scale_function=False,
-        hrf_library=hrf_vector 
-    )
-    
-    # Downsample from high-res (tres) to TR
-    n_tp_run = sig.shape[0]
-    idx = np.arange(0, n_tp_run, int(TR * tres))
-    
-    # Bounds check
-    if len(idx) > 0 and idx[-1] >= n_tp_run:
-        idx = idx[idx < n_tp_run]
-        
-    return sig[idx, 0]
 
 def generate_noise_volume(noise_dict: Dict, mask3d: np.ndarray, n_scans: int) -> np.ndarray:
     dims = (*mask3d.shape, n_scans)
@@ -355,7 +347,7 @@ def simulate_one_run(df_run: pd.DataFrame,
                      dec_dur_s: float,
                      tres: float,
                      hrf_type_sim: str,
-                     noise_dict: Dict,
+                     noise_dict: dict,
                      brain_mask: np.ndarray,
                      roi_mask: np.ndarray,
                      n_vox: int,
@@ -363,33 +355,69 @@ def simulate_one_run(df_run: pd.DataFrame,
                      decision_mix: float,
                      feedback_mix: float,
                      hrf_latency_mismatch_sd: float,
-                     nuisance_model: str) -> Dict[str, np.ndarray]:
+                     nuisance_model: str) -> dict:
 
+    # 1. Build Design Matrices (Uses the fixed convolve_to_TR)
     X_enc, X_dec, X_fb = build_event_mats(df_run, TR, pad_s, dec_dur_s, tres, hrf_type_sim)
     n_scans, n_trials = X_enc.shape
 
     if P_enc.shape[0] != n_trials:
         raise ValueError(f"P_enc rows ({P_enc.shape[0]}) != n_trials ({n_trials}). Check ordering/slicing.")
 
+    # 2. Create Event Patterns
     P_dec = make_noisy_event_patterns(P_enc, rng, decision_mix)
     P_fb  = make_noisy_event_patterns(P_enc, rng, feedback_mix)
 
+    # 3. Generate Signal
     Y_sig = (X_enc @ P_enc) + (X_dec @ P_dec) + (X_fb @ P_fb)
     Y_sig = apply_voxel_latency_shift(Y_sig, TR, rng, hrf_latency_mismatch_sd)
 
-    # Generate noise volume for n_scans (whole brain mask)
-    noise_vol = generate_noise_volume(noise_dict, brain_mask, n_scans)
+    # 4. Generate Noise (Optimized)
+    # We assume 'brain_mask' is already the CROPPED spatial mask (3D boolean)
+    spatial_dims = list(brain_mask.shape)
+    
+    # BrainIAK generate_noise signature wrapper
+    noise_vol_4d = fmrisim.generate_noise(
+        dimensions=spatial_dims + [n_scans],
+        stimfunction=None,
+        tr_duration=TR,
+        temporal_resolution=tres,
+        noise_dict=noise_dict,
+        mask=brain_mask, # Pass the boolean mask
+        template=None    # Use noise_dict statistics, not a template file
+    )
 
-    # pick n_vox from ROI mask
-    roi_flat = np.where(roi_mask.reshape(-1) > 0)[0]
-    if roi_flat.size < n_vox:
-        raise ValueError(f"ROI mask has {roi_flat.size} voxels < n_vox={n_vox}. Increase ROI size or lower n_vox.")
-    pick = rng.choice(roi_flat, size=n_vox, replace=False)
-    noise_2d = noise_vol.reshape(-1, n_scans)[pick].T  # (T,V)
+    # 5. Extract ROI Voxels
+    # Since we are using a cropped volume, indices in roi_mask match noise_vol_4d
+    roi_indices = np.where(roi_mask.reshape(-1) > 0)[0]
+    
+    if roi_indices.size < n_vox:
+        # Fallback: if ROI is too small, just take what we have
+        # or raise error if critical
+        print(f"Warning: ROI mask has only {roi_indices.size} voxels (requested {n_vox}). Using all available.")
+        n_vox_to_pick = roi_indices.size
+        pick = roi_indices
+    else:
+        n_vox_to_pick = n_vox
+        pick = rng.choice(roi_indices, size=n_vox, replace=False)
+    
+    # Flatten noise to (Time x Voxels)
+    # Reshape 4D (x,y,z,t) -> 2D (voxel, t) -> Transpose to (t, voxel)
+    noise_2d = noise_vol_4d.reshape(-1, n_scans)[pick].T 
+
+    # 6. Combine
+    # Ensure signal matches noise dimension
+    if Y_sig.shape[1] > noise_2d.shape[1]:
+        Y_sig = Y_sig[:, :noise_2d.shape[1]]
+    elif Y_sig.shape[1] < noise_2d.shape[1]:
+        # If we picked more noise voxels than we have signal patterns, tile the signal
+        # (Or usually you'd pick n_vox features from P_enc earlier)
+        Y_sig = np.tile(Y_sig, (1, int(np.ceil(noise_2d.shape[1]/Y_sig.shape[1]))))
+        Y_sig = Y_sig[:, :noise_2d.shape[1]]
 
     Y = Y_sig + noise_2d
 
-    # Fit trial-wise betas (encoding)
+    # 7. GLM Fitting (LS-A / LS-S)
     C = dct_basis(n_scans, TR, hp_cutoff)
 
     if nuisance_model == "summed":
@@ -407,21 +435,27 @@ def simulate_one_run(df_run: pd.DataFrame,
     Bhat_enc_lsa = Bhat[:n_trials, :]
 
     # LS-S
-    Bhat_enc_lss = np.zeros_like(P_enc)
+    Bhat_enc_lss = np.zeros_like(Bhat_enc_lsa) # Initialize with correct shape
+    
+    # Pre-calculate X_others sum to speed up loop
+    X_enc_sum = X_enc.sum(axis=1, keepdims=True)
+    
     for j in range(n_trials):
         x_this = X_enc[:, [j]]
-        x_others = np.sum(np.delete(X_enc, j, axis=1), axis=1, keepdims=True)
+        # Efficiently calculate "others" by subtracting current from sum
+        x_others = X_enc_sum - x_this
+        
         X_lss = np.column_stack([x_this, x_others, X_nuis])
         b = pinv_beta(X_lss, Y)
         Bhat_enc_lss[j] = b[0, :]
 
     return {
         "Y": Y,
-        "P_enc": P_enc,
+        "P_enc": P_enc[:, :n_vox_to_pick], # Return matched patterns
         "Bhat_enc_lsa": Bhat_enc_lsa,
         "Bhat_enc_lss": Bhat_enc_lss,
-        "rec_lsa": corr_rows(P_enc, Bhat_enc_lsa),
-        "rec_lss": corr_rows(P_enc, Bhat_enc_lss),
+        "rec_lsa": corr_rows(P_enc[:, :n_vox_to_pick], Bhat_enc_lsa),
+        "rec_lss": corr_rows(P_enc[:, :n_vox_to_pick], Bhat_enc_lss),
     }
 
 
