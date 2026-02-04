@@ -39,7 +39,7 @@ import argparse
 import math
 from pathlib import Path
 from typing import Dict, Tuple
-
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import nibabel as nib
@@ -49,6 +49,37 @@ from brainiak.utils import fmrisim
 
 
 REQUIRED_COLS = {"run_id","trial_id","img_onset","img_dur","dec_onset_est","isi2_dur","fb_dur"}
+
+from scipy.stats import gamma
+
+def get_double_gamma_hrf(temporal_resolution, duration=32.0):
+    """
+    Manually generate a double-gamma HRF vector (1D).
+    This mimics the standard SPM/Glover HRF used by BrainIAK but 
+    ensures the output is a flat 1D array to prevent dimension errors.
+    """
+    # Parameters (Standard SPM/Glover defaults)
+    peak_delay = 6.0
+    undershoot_delay = 12.0
+    peak_disp = 1.0
+    undershoot_disp = 1.0
+    p_u_ratio = 1.0 / 6.0
+    
+    # Create time vector
+    tr_step = 1.0 / temporal_resolution
+    t = np.arange(0, duration, tr_step)
+    
+    # Calculate PDF
+    peak = gamma.pdf(t, peak_delay / peak_disp, scale=peak_disp)
+    undershoot = gamma.pdf(t, undershoot_delay / undershoot_disp, scale=undershoot_disp)
+    
+    hrf = peak - p_u_ratio * undershoot
+    
+    # Normalize max amplitude to 1
+    if np.max(np.abs(hrf)) > 0:
+        hrf = hrf / np.max(np.abs(hrf))
+        
+    return hrf
 
 
 # ------------------------
@@ -90,15 +121,75 @@ def build_stimfunction(onsets: np.ndarray, durs: np.ndarray, total_time_s: float
         temporal_resolution=tres
     )
 
-def convolve_to_TR(stim_1d: np.ndarray, TR: float, tres: float, hrf_type="double_gamma") -> np.ndarray:
+def auto_crop_data(nifti_data, x_pct=0.80, y_pct=0.15, z_pct=0.35, crop_size=30):
+    """Automatically crops the brain to a small box around the target percentage."""
+    print(f"  Auto-cropping to: {x_pct:.2f}X, {y_pct:.2f}Y, {z_pct:.2f}Z (Size: {crop_size})")
+    
+    # Simple brain mask
+    mean_vol = np.mean(nifti_data, axis=3)
+    threshold = np.percentile(mean_vol, 50)
+    coords = np.argwhere(mean_vol > threshold)
+    
+    if coords.size == 0: return nifti_data # Fallback
+    
+    x_min, y_min, z_min = coords.min(axis=0)
+    x_max, y_max, z_max = coords.max(axis=0)
+    
+    # Find center
+    center_x = int(x_min + (x_max - x_min) * x_pct)
+    center_y = int(y_min + (y_max - y_min) * y_pct)
+    center_z = int(z_min + (z_max - z_min) * z_pct)
+    
+    # Crop
+    s = crop_size // 2
+    sx = slice(max(0, center_x - s), min(nifti_data.shape[0], center_x + s))
+    sy = slice(max(0, center_y - s), min(nifti_data.shape[1], center_y + s))
+    sz = slice(max(0, center_z - s), min(nifti_data.shape[2], center_z + s))
+    
+    return nifti_data[sx, sy, sz, :]
+
+
+def convolve_to_TR(stim, TR, tres, hrf_type='double_gamma'):
+    """
+    Convolve high-res stimulation vector to TR resolution.
+    Returns 1D array of length n_TRs.
+    """
+    # Force stim to be 2D (time x conditions) for brainiak requirements
+    if stim.ndim == 1:
+        stim = stim.reshape(-1, 1)
+
+    # --- FIX START: Generate HRF manually as 1D array ---
+    # We ignore the 'hrf_type' string and use our robust function
+    # to prevent "object too deep" errors in np.convolve
+    if isinstance(hrf_type, str):
+        hrf_vector = get_double_gamma_hrf(temporal_resolution=tres)
+    else:
+        # If a vector was passed directly, use it
+        hrf_vector = hrf_type
+        
+    # Double check it is 1D (Critical for numpy < 1.18 compatibility)
+    if hasattr(hrf_vector, 'flatten'):
+        hrf_vector = hrf_vector.flatten()
+    # --- FIX END ----------------------------------------
+
+    # Call fmrisim with the explicit 1D HRF vector
     sig = fmrisim.convolve_hrf(
-        stimfunction=stim_1d[:, None],
+        stimfunction=stim,
         tr_duration=TR,
-        hrf_type=hrf_type,
-        scale_function=True,
-        temporal_resolution=tres
+        temporal_resolution=tres,
+        scale_function=False,
+        hrf_library=hrf_vector 
     )
-    return sig.squeeze(-1)
+    
+    # Downsample from high-res (tres) to TR
+    n_tp_run = sig.shape[0]
+    idx = np.arange(0, n_tp_run, int(TR * tres))
+    
+    # Bounds check
+    if len(idx) > 0 and idx[-1] >= n_tp_run:
+        idx = idx[idx < n_tp_run]
+        
+    return sig[idx, 0]
 
 def generate_noise_volume(noise_dict: Dict, mask3d: np.ndarray, n_scans: int) -> np.ndarray:
     dims = (*mask3d.shape, n_scans)
@@ -436,7 +527,7 @@ def main():
     rng_master = np.random.default_rng(args.seed)
     rows = []
 
-    for rep in range(args.n_reps):
+    for rep in tqdm(range(args.n_reps), desc="Simulating Reps"):
         rng = np.random.default_rng(rng_master.integers(0, 2**32 - 1))
         for rid in run_ids:
             df_run = df[df["run_id"] == rid].copy()

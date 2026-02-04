@@ -6,6 +6,9 @@
 
 # Large task images
 images/task_images/
+
+# Any frmi Files
+*.nii
 # User-specific files
 *.rsuser
 *.suo
