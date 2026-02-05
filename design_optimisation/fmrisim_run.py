@@ -40,6 +40,8 @@ import math
 import hashlib
 import json
 import pickle
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Tuple
 from tqdm import tqdm
@@ -656,6 +658,71 @@ def _stable_hash(obj) -> str:
     s = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(s).hexdigest()[:12]
 
+
+def _mask_hash(mask: np.ndarray) -> str:
+    """Stable short hash for a mask array used in cache keys.
+
+    We hash the *content* (not object id) so cache invalidates if the mask changes.
+    """
+    if mask is None:
+        return "none"
+    arr = np.asarray(mask)
+    # Make deterministic + compact
+    arr_u8 = np.ascontiguousarray((arr > 0).astype(np.uint8))
+    h = hashlib.sha1()
+    h.update(str(arr_u8.shape).encode("utf-8"))
+    h.update(arr_u8.tobytes())
+    return h.hexdigest()[:12]
+
+
+
+def _sanitize_name(s: str) -> str:
+    """Filesystem-safe identifier."""
+    s = str(s)
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+    return s or "unnamed"
+
+
+def infer_design_group_from_csv(csv_path: Path) -> str:
+    """Infer the design 'group' folder from a CSV path.
+
+    Expected layout:
+      .../experimental_task/task_designs/<DESIGN_GROUP>/session-1/<file>.csv
+
+    Robust fallbacks:
+      - If 'task_designs' appears in the path parts, return the segment after it
+      - Else if parent is 'session-*', return parent's parent
+      - Else return immediate parent name
+    """
+    p = Path(csv_path)
+    parts = list(p.parts)
+    if "task_designs" in parts:
+        i = parts.index("task_designs")
+        if i + 1 < len(parts):
+            return _sanitize_name(parts[i + 1])
+    # fallback: .../<group>/session-1/<file>.csv
+    if p.parent.name.lower().startswith("session-") and p.parent.parent is not None:
+        return _sanitize_name(p.parent.parent.name)
+    return _sanitize_name(p.parent.name)
+
+
+def infer_dataset_id_from_noise_path(noise_nii: str) -> str:
+    """Dataset identifier used for shared noise caching."""
+    p = Path(noise_nii)
+    # handle .nii.gz
+    name = p.name
+    if name.endswith(".nii.gz"):
+        stem = name[:-7]
+    else:
+        stem = p.stem
+    return _sanitize_name(stem)
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def load_or_make_noise_dict(vol4d: np.ndarray, noise_nii_path: str, TR: float, cache_dir: Path, use_cache: bool) -> Tuple[dict, np.ndarray, np.ndarray]:
     """
     Follow the BrainIAK fmrisim multivariate example as closely as possible:
@@ -746,6 +813,198 @@ def load_or_make_run_noise_2d_doc(
             raise ValueError(f"Cached run noise has shape {noise_2d.shape} but expected {(n_scans, n_vox)}.")
         return noise_2d
 
+
+# ------------------------
+# Shared noise bank (ROI-only) for cross-design reuse
+# ------------------------
+def _noise_bank_key(
+    noise_nii_path: str,
+    TR: float,
+    n_vox: int,
+    roi_mask: np.ndarray,
+    brain_mask: np.ndarray,
+    noise_dict: dict,
+    max_n_scans: int,
+    n_noise_reps: int,
+    noise_cache_seed: int,
+) -> str:
+    """Key that changes when underlying noise inputs or requirements change."""
+    try:
+        st = Path(noise_nii_path).stat()
+        nii_fingerprint = {"path": str(Path(noise_nii_path).resolve()), "size": st.st_size, "mtime": int(st.st_mtime)}
+    except Exception:
+        nii_fingerprint = {"path": str(noise_nii_path)}
+
+    return _stable_hash(
+        {
+            "nii": nii_fingerprint,
+            "TR": float(TR),
+            "n_vox": int(n_vox),
+            "max_n_scans": int(max_n_scans),
+            "n_noise_reps": int(n_noise_reps),
+            "noise_cache_seed": int(noise_cache_seed),
+            "roi_vox": int(np.sum(roi_mask > 0)),
+            "brain_vox": int(np.sum(brain_mask > 0)),
+            # A light fingerprint of noise_dict content (not fully serializing large items)
+            "noise_dict_keys": sorted(list(noise_dict.keys())) if isinstance(noise_dict, dict) else str(type(noise_dict)),
+        }
+    )
+
+
+def _pick_roi_voxels(roi_mask: np.ndarray, brain_mask: np.ndarray, n_vox: int, seed: int) -> np.ndarray:
+    roi_bool = (roi_mask > 0) & (brain_mask > 0)
+    roi_lin = np.flatnonzero(roi_bool.reshape(-1))
+    if roi_lin.size < n_vox:
+        raise ValueError(f"ROI has {roi_lin.size} voxels inside brain_mask but n_vox={n_vox} requested.")
+    rng = np.random.default_rng(int(seed))
+    return rng.choice(roi_lin, size=int(n_vox), replace=False)
+
+
+def _generate_one_noise_rep_roi(
+    rep_idx: int,
+    max_n_scans: int,
+    TR: float,
+    brain_mask: np.ndarray,
+    template: np.ndarray,
+    noise_dict: dict,
+    pick_lin: np.ndarray,
+    seed: int,
+) -> np.ndarray:
+    """Worker: generate one whole-brain noise 4D, then sample ROI voxels -> (T x n_vox)."""
+    # Make a rep-specific RNG state by offsetting the seed inside noise_dict if possible.
+    # BrainIAK uses values inside noise_dict; many variants respect 'seed' / numpy global RNG.
+    # We set numpy's bitgen via default_rng and use it to perturb template slightly if needed.
+    # Most importantly: we randomize fmrisim's internal draws by setting the global seed.
+    np.random.seed(int(seed) + int(rep_idx) * 10007)
+
+    stimfunction_tr = [0] * int(max_n_scans)
+    noise_4d = fmrisim.generate_noise(
+        dimensions=list(brain_mask.shape),
+        stimfunction_tr=stimfunction_tr,
+        tr_duration=float(TR),
+        mask=brain_mask,
+        template=template,
+        noise_dict=noise_dict,
+    )
+
+    noise_2d = noise_4d.reshape(-1, max_n_scans)[pick_lin].T.astype(np.float32)  # (T, n_vox)
+    return noise_2d
+
+
+def load_or_make_noise_bank_roi(
+    noise_nii_path: str,
+    TR: float,
+    n_vox: int,
+    roi_mask: np.ndarray,
+    brain_mask: np.ndarray,
+    template: np.ndarray,
+    noise_dict: dict,
+    max_n_scans: int,
+    n_noise_reps: int,
+    cache_dir: Path,
+    use_cache: bool,
+    noise_cache_seed: int,
+    n_parallel: int = 1,
+) -> tuple[np.ndarray, dict]:
+    """Create/load a bank of ROI noise time-series for cross-design reuse.
+
+    Returns:
+      noise_bank: (n_noise_reps, max_n_scans, n_vox) float32
+      meta: dict with bookkeeping (key, max_n_scans, n_noise_reps, pick_lin hash)
+    """
+    ensure_dir(cache_dir)
+
+    # Use a fixed voxel sample for the ROI across all reps & designs (important for comparability)
+    pick_lin = _pick_roi_voxels(roi_mask, brain_mask, n_vox=n_vox, seed=int(noise_cache_seed))
+
+    key = _noise_bank_key(
+        noise_nii_path=noise_nii_path,
+        TR=TR,
+        n_vox=n_vox,
+        roi_mask=roi_mask,
+        brain_mask=brain_mask,
+        noise_dict=noise_dict,
+        max_n_scans=max_n_scans,
+        n_noise_reps=n_noise_reps,
+        noise_cache_seed=noise_cache_seed,
+    )
+    bank_path = cache_dir / f"noise_bank_roi_{key}.npz"
+    meta_path = cache_dir / f"noise_bank_roi_{key}.json"
+
+    if use_cache and bank_path.exists():
+        dat = np.load(bank_path)
+        noise_bank = dat["noise_bank"].astype(np.float32)
+        if noise_bank.shape != (int(n_noise_reps), int(max_n_scans), int(n_vox)):
+            raise ValueError(
+                f"Cached noise bank has shape {noise_bank.shape} but expected {(int(n_noise_reps), int(max_n_scans), int(n_vox))}."
+            )
+        try:
+            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        except Exception:
+            meta = {}
+        return noise_bank, meta
+
+    # Otherwise generate from scratch (cannot 'extend' reliably without regenerating due to model dependence on T)
+    noise_bank = np.zeros((int(n_noise_reps), int(max_n_scans), int(n_vox)), dtype=np.float32)
+
+    if int(n_parallel) <= 1:
+        for r in range(int(n_noise_reps)):
+            noise_bank[r] = _generate_one_noise_rep_roi(
+                rep_idx=r,
+                max_n_scans=max_n_scans,
+                TR=TR,
+                brain_mask=brain_mask,
+                template=template,
+                noise_dict=noise_dict,
+                pick_lin=pick_lin,
+                seed=int(noise_cache_seed),
+            )
+    else:
+        # ProcessPool: avoids GIL; keep args pickleable
+        with ProcessPoolExecutor(max_workers=int(n_parallel)) as ex:
+            futs = []
+            for r in range(int(n_noise_reps)):
+                futs.append(
+                    ex.submit(
+                        _generate_one_noise_rep_roi,
+                        r,
+                        int(max_n_scans),
+                        float(TR),
+                        brain_mask,
+                        template,
+                        noise_dict,
+                        pick_lin,
+                        int(noise_cache_seed),
+                    )
+                )
+            for fut in as_completed(futs):
+                pass
+            # Collect in submission order to keep deterministic indexing
+            for r, fut in enumerate(futs):
+                noise_bank[r] = fut.result()
+
+    if use_cache:
+        np.savez_compressed(bank_path, noise_bank=noise_bank)
+        meta = {
+            "key": key,
+            "noise_nii_path": str(noise_nii_path),
+            "TR": float(TR),
+            "n_vox": int(n_vox),
+            "max_n_scans": int(max_n_scans),
+            "n_noise_reps": int(n_noise_reps),
+            "noise_cache_seed": int(noise_cache_seed),
+            "pick_lin_sha1": hashlib.sha1(pick_lin.tobytes()).hexdigest(),
+        }
+        try:
+            meta_path.write_text(json.dumps(meta, indent=2))
+        except Exception:
+            pass
+    else:
+        meta = {"key": key}
+
+    return noise_bank, meta
+
+
     # Whole-brain noise generation per docs
     stimfunction_tr = [0] * int(n_scans)
     noise_4d = fmrisim.generate_noise(
@@ -771,6 +1030,197 @@ def load_or_make_run_noise_2d_doc(
         np.savez_compressed(npz_path, noise_2d=noise_2d)
 
     return noise_2d
+
+
+# ------------------------
+# Run-length noise cache (ROI-only): runs × reps, cached per dataset for realism
+# ------------------------
+def _run_noise_key(
+    noise_nii_path: str,
+    TR: float,
+    n_vox: int,
+    roi_mask: np.ndarray,
+    brain_mask: np.ndarray,
+    noise_dict: dict,
+    noise_cache_seed: int,
+) -> str:
+    """Key for run-length noise files (excluding n_scans, run_id, rep_idx)."""
+    try:
+        nii_stat = os.stat(noise_nii_path)
+        nii_sig = f"{Path(noise_nii_path).name}:{int(nii_stat.st_size)}:{int(nii_stat.st_mtime)}"
+    except Exception:
+        nii_sig = f"{Path(noise_nii_path).name}"
+    parts = [
+        f"nii={nii_sig}",
+        f"TR={float(TR):.6f}",
+        f"n_vox={int(n_vox)}",
+        f"seed={int(noise_cache_seed)}",
+        f"roi={_mask_hash(roi_mask)}",
+        f"brain={_mask_hash(brain_mask)}",
+        f"ndict={json.dumps(noise_dict, sort_keys=True, default=str)}",
+    ]
+    return _stable_hash("|".join(parts))[:16]
+
+
+def _dataset_id_from_noise_nii(noise_nii_path: str) -> str:
+    """Folder-friendly dataset identifier from noise file name."""
+    base = Path(noise_nii_path).name
+    for suf in [".nii.gz", ".nii", ".mgz", ".mgh", ".gz"]:
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
+    return base or "noise"
+
+
+def load_or_make_run_noise_roi_set(
+    noise_nii_path: str,
+    TR: float,
+    n_vox: int,
+    roi_mask: np.ndarray,
+    brain_mask: np.ndarray,
+    template: np.ndarray,
+    noise_dict: dict,
+    run_n_scans: Dict,
+    n_noise_reps: int,
+    cache_dir: Path,
+    use_cache: bool,
+    noise_cache_seed: int,
+    n_parallel: int = 1,
+) -> tuple[Dict, dict]:
+    """Create/load run-length ROI noise for each (run_id, rep_idx).
+
+    Returns:
+      run_noise: dict[(run_id, rep_idx)] -> (n_scans_run, n_vox) float32
+      meta: dict with bookkeeping (key, dataset_id, pick_lin hash)
+    """
+    ensure_dir(cache_dir)
+
+    dataset_id = _dataset_id_from_noise_nii(noise_nii_path)
+    ds_dir = cache_dir / dataset_id
+    ensure_dir(ds_dir)
+
+    # Fixed voxel sample for ROI across all runs & reps (comparability)
+    pick_lin = _pick_roi_voxels(roi_mask, brain_mask, n_vox=n_vox, seed=int(noise_cache_seed))
+    key = _run_noise_key(
+        noise_nii_path=noise_nii_path,
+        TR=TR,
+        n_vox=n_vox,
+        roi_mask=roi_mask,
+        brain_mask=brain_mask,
+        noise_dict=noise_dict,
+        noise_cache_seed=noise_cache_seed,
+    )
+
+    # Helper to build file paths
+    def _paths_for(rid, rep_idx: int, n_scans: int) -> tuple[Path, Path]:
+        run_dir = ds_dir / f"run-{rid}"
+        ensure_dir(run_dir)
+        npz = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}_T{int(n_scans)}.npz"
+        meta = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}_T{int(n_scans)}.json"
+        return npz, meta
+
+    # If cached file exists but has wrong shape/length, we regenerate (safe: fmrisim noise depends on T).
+    def _load_if_ok(rid, rep_idx: int, n_scans: int) -> Optional[np.ndarray]:
+        # Find any candidate files for this rid/rep/key, regardless of T, and validate.
+        run_dir = ds_dir / f"run-{rid}"
+        if not run_dir.exists():
+            return None
+        cand = sorted(run_dir.glob(f"noise_roi_{key}_rep{int(rep_idx):03d}_T*.npz"))
+        if not cand:
+            return None
+        # Prefer exact T match if present
+        exact = [p for p in cand if f"_T{int(n_scans)}.npz" in p.name]
+        ordered = exact + [p for p in cand if p not in exact]
+        for npz_path in ordered:
+            try:
+                dat = np.load(npz_path)
+                arr = dat["noise_2d"].astype(np.float32)
+                if arr.shape == (int(n_scans), int(n_vox)):
+                    return arr
+            except Exception:
+                continue
+        return None
+
+    # Worker to generate one (rid, rep_idx)
+    # Helper: stable seed per (run_id, rep_idx) so caching is deterministic.
+    def _seed_for(rid, rep_idx: int) -> int:
+        rid_h = int(_stable_hash(str(rid))[:8], 16)
+        return (int(noise_cache_seed) + rid_h + int(rep_idx) * 10007) % (2**32 - 1)
+
+# Plan tasks
+    tasks = []
+    run_noise: Dict = {}
+
+    for rid, n_scans in run_n_scans.items():
+        n_scans = int(n_scans)
+        for rep_idx in range(int(n_noise_reps)):
+            if use_cache:
+                cached = _load_if_ok(rid, rep_idx, n_scans)
+                if cached is not None:
+                    run_noise[(rid, rep_idx)] = cached
+                    continue
+            tasks.append((rid, rep_idx, n_scans, _seed_for(rid, rep_idx)))
+
+    # Generate missing tasks (optionally parallel)
+    if tasks:
+        if int(n_parallel) <= 1:
+            for rid, rep_idx, n_scans, seed in tasks:
+                arr = _generate_one_noise_rep_roi(
+                    rep_idx=int(rep_idx),
+                    max_n_scans=int(n_scans),
+                    TR=float(TR),
+                    brain_mask=brain_mask,
+                    template=template,
+                    noise_dict=noise_dict,
+                    pick_lin=pick_lin,
+                    seed=int(seed),
+                )
+                run_noise[(rid, rep_idx)] = arr
+        else:
+            with ProcessPoolExecutor(max_workers=int(n_parallel)) as ex:
+                futs = []
+                for rid, rep_idx, n_scans, seed in tasks:
+                    futs.append(ex.submit(_generate_one_noise_rep_roi, int(rep_idx), int(n_scans), float(TR), brain_mask, template, noise_dict, pick_lin, int(seed)))
+                for (rid, rep_idx, n_scans, seed), fut in zip(tasks, futs):
+                    run_noise[(rid, rep_idx)] = fut.result()
+
+    # Persist any newly generated arrays
+    if use_cache:
+        for (rid, rep_idx), arr in run_noise.items():
+            n_scans = int(arr.shape[0])
+            npz_path, meta_path = _paths_for(rid, rep_idx, n_scans)
+            if not npz_path.exists():
+                np.savez_compressed(npz_path, noise_2d=arr.astype(np.float32))
+                meta = {
+                    "key": key,
+                    "dataset_id": dataset_id,
+                    "noise_nii_path": str(noise_nii_path),
+                    "TR": float(TR),
+                    "n_vox": int(n_vox),
+                    "n_scans": int(n_scans),
+                    "run_id": str(rid),
+                    "rep_idx": int(rep_idx),
+                    "pick_lin_hash": _stable_hash(pick_lin.tobytes())[:16],
+                    "noise_cache_seed": int(noise_cache_seed),
+                    "noise_dict": noise_dict,
+                }
+                try:
+                    meta_path.write_text(json.dumps(meta, indent=2))
+                except Exception:
+                    pass
+
+    meta = {
+        "key": key,
+        "dataset_id": dataset_id,
+        "noise_nii_path": str(noise_nii_path),
+        "TR": float(TR),
+        "n_vox": int(n_vox),
+        "n_noise_reps": int(n_noise_reps),
+        "pick_lin_hash": _stable_hash(pick_lin.tobytes())[:16],
+    }
+    return run_noise, meta
+
 
 def compute_n_scans_for_run(df_run: pd.DataFrame, TR: float, pad_s: float, dec_dur_s: float) -> int:
     dec_on = df_run["dec_onset_est"].to_numpy(float)
@@ -1144,6 +1594,11 @@ def main():
 
     ap.add_argument("--n_reps", type=int, default=1,
                     help="Number of simulation repetitions to run (each rep simulates all runs once).")
+    ap.add_argument("--noise_reps", type=int, default=None,
+                    help="Number of independent noise repetitions to generate/cache for cross-design reuse. "
+                         "Default: same as --n_reps.")
+    ap.add_argument("--n_parallel", type=int, default=1,
+                    help="Parallel workers for generating independent noise repetitions (ProcessPool).")
     ap.add_argument("--rsa_null_perms", type=int, default=200,
                     help="Number of permutations for voxel-shuffle null of anchored RSA (0 to disable).")
     ap.add_argument("--seed", type=int, default=0)
@@ -1214,9 +1669,16 @@ def main():
     aff = noise_img.affine
     shape3d = vol4d.shape[:3]
     # Noise model estimation and caching (doc-style pipeline)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(args.noise_cache_dir) if args.noise_cache_dir else (out_dir / "noise_cache")
+    base_out_dir = Path(args.out_dir)
+    design_group = infer_design_group_from_csv(Path(args.csv))
+    out_dir = ensure_dir(base_out_dir / design_group)
+
+    # Shared noise cache lives under base_out_dir/noise/<dataset_id> by default (cross-design reuse)
+    dataset_id = infer_dataset_id_from_noise_path(args.noise_nii)
+    noise_root = ensure_dir(base_out_dir / "noise" / dataset_id)
+
+    # Allow override for all noise-related caches
+    cache_dir = Path(args.noise_cache_dir) if args.noise_cache_dir else noise_root
 
     noise_dict, brain_mask, template = load_or_make_noise_dict(
         vol4d=vol4d,
@@ -1304,25 +1766,40 @@ def main():
         run_slices[rid] = slice(idx0, idx0 + n)
         idx0 += n
 
-    # Pre-generate / cache run-specific ROI noise (T x n_vox) so we don't regenerate noise every rep
-    cached_run_noise: Dict = {}
+    # Precompute required n_scans per run, then build/load a *shared* noise bank long enough for this design.
+    run_n_scans: Dict = {}
+    max_n_scans = 0
     for rid in run_ids:
         df_run = df[df["run_id"] == rid].copy()
         n_scans_r = compute_n_scans_for_run(df_run, TR=args.TR, pad_s=args.pad_s, dec_dur_s=args.dec_dur_s)
-        cached_run_noise[rid] = load_or_make_run_noise_2d_doc(
-            run_id=rid,
-            n_scans=n_scans_r,
-            TR=args.TR,
-            noise_dict=noise_dict,
-            brain_mask=brain_mask,
-            template=template,
-            roi_mask=roi_mask,
-            n_vox=args.n_vox,
-            cache_dir=cache_dir,
-            use_cache=bool(args.cache_run_noise),
-            noise_cache_seed=int(args.noise_cache_seed),
-        )
+        run_n_scans[rid] = int(n_scans_r)
+        max_n_scans = max(max_n_scans, int(n_scans_r))
 
+    # --- Coupled noise reps ---
+    # Couple simulation repetitions (n_reps) to noise repetitions: simulation rep i uses noise rep i.
+    # If --noise_reps is provided, treat it as a *minimum* cache size, but always ensure we have
+    # at least n_reps noise indices available.
+    n_noise_reps = max(
+        1,
+        int(args.n_reps),
+        int(args.noise_reps) if args.noise_reps is not None else 0,
+    )
+
+    run_noise, noise_meta = load_or_make_run_noise_roi_set(
+        noise_nii_path=str(args.noise_nii),
+        TR=float(args.TR),
+        n_vox=int(args.n_vox),
+        roi_mask=roi_mask,
+        brain_mask=brain_mask,
+        template=template,
+        noise_dict=noise_dict,
+        run_n_scans=run_n_scans,
+        n_noise_reps=int(n_noise_reps),
+        cache_dir=cache_dir,
+        use_cache=bool(args.cache_run_noise),
+        noise_cache_seed=int(args.noise_cache_seed),
+        n_parallel=int(args.n_parallel),
+    )
     rng_master = np.random.default_rng(args.seed)
     rows = []
 
@@ -1331,6 +1808,24 @@ def main():
         for rid in run_ids:
             df_run = df[df["run_id"] == rid].copy()
             P_enc = P_all[run_slices[rid]].copy()
+
+            # Ensure the coupled noise index exists; if missing after loading, regenerate on-demand.
+            if (rid, int(rep)) not in run_noise:
+                run_noise, noise_meta = load_or_make_run_noise_roi_set(
+                    noise_nii_path=str(args.noise_nii),
+                    TR=float(args.TR),
+                    n_vox=int(args.n_vox),
+                    roi_mask=roi_mask,
+                    brain_mask=brain_mask,
+                    template=template,
+                    noise_dict=noise_dict,
+                    run_n_scans=run_n_scans,
+                    n_noise_reps=int(rep) + 1,
+                    cache_dir=cache_dir,
+                    use_cache=bool(args.cache_run_noise),
+                    noise_cache_seed=int(args.noise_cache_seed),
+                    n_parallel=int(args.n_parallel),
+                )
 
             res = simulate_one_run(
                 df_run=df_run,
@@ -1341,7 +1836,7 @@ def main():
                 dec_dur_s=args.dec_dur_s,
                 tres=args.temporal_resolution,
                 hrf_type_sim="double_gamma",
-                noise_2d=cached_run_noise[rid],
+                noise_2d=run_noise[(rid, int(rep))],
                 n_vox=args.n_vox,
                 rng=rng,
                 decision_mix=args.decision_mix,
