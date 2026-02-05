@@ -44,7 +44,16 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Tuple
-from tqdm import tqdm
+# Optional progress bars (tqdm). Falls back to plain iterators if unavailable.
+try:
+    from tqdm import tqdm, trange
+except Exception:  # pragma: no cover
+    def tqdm(x, *args, **kwargs):
+        return x
+
+    def trange(n, *args, **kwargs):
+        return range(n)
+
 import numpy as np
 import pandas as pd
 import nibabel as nib
@@ -2064,14 +2073,15 @@ def optimise_designs(args) -> None:
     eval_seed_base = int(args.opt_seed) * 100000 + 17
 
     total_evals = 0
-    for gen in range(generations):
+    gen_pbar = trange(generations, desc='Optimiser generations')
+    for gen in gen_pbar:
         # Evaluate population
         jobs = []
         with ProcessPoolExecutor(max_workers=n_workers) as ex:
             for i, ind in enumerate(pop):
                 jobs.append(ex.submit(_eval_one, ind, eval_seed_base + gen * 10000 + i))
             results = []
-            for fut in as_completed(jobs):
+            for fut in tqdm(as_completed(jobs), total=len(jobs), desc=f'Gen {gen+1}/{generations} candidates', leave=False):
                 r = fut.result()
                 if r is not None:
                     results.append(r)
@@ -2084,6 +2094,17 @@ def optimise_designs(args) -> None:
 
         # Save best of this gen
         best_obj, best_s1, best_df, best_params = elites[0]
+        # Update progress bar with best-so-far metrics
+        try:
+            gen_pbar.set_postfix(
+                best_obj=f"{best_obj:.4g}",
+                coll_p95=f"{best_s1.get('coll_p95_worst', float('nan')):.3g}",
+                coll_max=f"{best_s1.get('coll_max_worst', float('nan')):.3g}",
+                cov_chi2=f"{best_s1.get('cov_chi2_worst', float('nan')):.3g}",
+                cov_minbin=int(best_s1.get('cov_minbin_worst', -1)),
+            )
+        except Exception:
+            pass
         gen_dir = out_dir / "stage1_top"
         ensure_dir(gen_dir)
         best_path = gen_dir / f"best_gen{gen:03d}.csv"
