@@ -1113,33 +1113,86 @@ def load_or_make_run_noise_roi_set(
     )
 
     # Helper to build file paths
-    def _paths_for(rid, rep_idx: int, n_scans: int) -> tuple[Path, Path]:
+    def _paths_for(rid, rep_idx: int) -> tuple[Path, Path]:
+        """New cache layout: exactly one file per (dataset_id, run_id, rep_idx, key)."""
         run_dir = ds_dir / f"run-{rid}"
         ensure_dir(run_dir)
-        npz = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}_T{int(n_scans)}.npz"
-        meta = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}_T{int(n_scans)}.json"
+        npz = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}.npz"
+        meta = run_dir / f"noise_roi_{key}_rep{int(rep_idx):03d}.json"
         return npz, meta
 
-    # If cached file exists but has wrong shape/length, we regenerate (safe: fmrisim noise depends on T).
-    def _load_if_ok(rid, rep_idx: int, n_scans: int) -> Optional[np.ndarray]:
-        # Find any candidate files for this rid/rep/key, regardless of T, and validate.
+    def _headroom_T(T_needed: int, frac: float = 1.1) -> int:
+        return int(max(int(T_needed), int(math.ceil(float(T_needed) * float(frac)))))
+
+    def _valid_cached_array(arr: np.ndarray, T_needed: int) -> bool:
+        if arr is None:
+            return False
+        if arr.ndim != 2:
+            return False
+        if int(arr.shape[1]) != int(n_vox):
+            return False
+        if int(arr.shape[0]) < int(T_needed):
+            return False
+        return True
+
+    # Backward compatible cache loading:
+    # - Prefer new filename (no _T{n_scans})
+    # - Otherwise, look for old *_T*.npz files, pick the largest T, and rewrite to new name
+    def _load_if_ok(rid, rep_idx: int, T_needed: int) -> Optional[np.ndarray]:
         run_dir = ds_dir / f"run-{rid}"
         if not run_dir.exists():
             return None
+
+        # 1) New filename
+        new_npz, _ = _paths_for(rid, rep_idx)
+        if new_npz.exists():
+            try:
+                dat = np.load(new_npz)
+                arr = dat["noise_2d"].astype(np.float32)
+                # T_cached stored for bookkeeping; prefer it if present
+                T_cached = int(dat["T_cached"]) if "T_cached" in dat.files else int(arr.shape[0])
+                if int(arr.shape[0]) != int(T_cached):
+                    # shape/metadata mismatch
+                    return None
+                if _valid_cached_array(arr, T_needed=int(T_needed)):
+                    return arr[: int(T_needed)]
+            except Exception:
+                return None
+
+        # 2) Old filename(s): noise_roi_{key}_rep###_T*.npz
         cand = sorted(run_dir.glob(f"noise_roi_{key}_rep{int(rep_idx):03d}_T*.npz"))
         if not cand:
             return None
-        # Prefer exact T match if present
-        exact = [p for p in cand if f"_T{int(n_scans)}.npz" in p.name]
-        ordered = exact + [p for p in cand if p not in exact]
-        for npz_path in ordered:
+
+        best_arr = None
+        best_T = -1
+        best_path = None
+        for npz_path in cand:
             try:
                 dat = np.load(npz_path)
                 arr = dat["noise_2d"].astype(np.float32)
-                if arr.shape == (int(n_scans), int(n_vox)):
-                    return arr
+                T_cached = int(arr.shape[0])
+                if int(arr.shape[1]) != int(n_vox):
+                    continue
+                if T_cached > best_T:
+                    best_T = T_cached
+                    best_arr = arr
+                    best_path = npz_path
             except Exception:
                 continue
+
+        if best_arr is None:
+            return None
+
+        if _valid_cached_array(best_arr, T_needed=int(T_needed)):
+            # Rewrite into the new filename for future loads
+            try:
+                np.savez_compressed(new_npz, noise_2d=best_arr.astype(np.float32), T_cached=int(best_arr.shape[0]))
+            except Exception:
+                pass
+            return best_arr[: int(T_needed)]
+
+        # Old cache exists but is too short
         return None
 
     # Worker to generate one (rid, rep_idx)
@@ -1151,6 +1204,9 @@ def load_or_make_run_noise_roi_set(
 # Plan tasks
     tasks = []
     run_noise: Dict = {}
+    # Keep any freshly generated headroom arrays around so we can persist them,
+    # while still returning exact-length slices to callers.
+    run_noise_full: Dict = {}
 
     for rid, n_scans in run_n_scans.items():
         n_scans = int(n_scans)
@@ -1166,9 +1222,11 @@ def load_or_make_run_noise_roi_set(
     if tasks:
         if int(n_parallel) <= 1:
             for rid, rep_idx, n_scans, seed in tasks:
-                arr = _generate_one_noise_rep_roi(
+                T_needed = int(n_scans)
+                T_gen = _headroom_T(T_needed)
+                arr_full = _generate_one_noise_rep_roi(
                     rep_idx=int(rep_idx),
-                    max_n_scans=int(n_scans),
+                    max_n_scans=int(T_gen),
                     TR=float(TR),
                     brain_mask=brain_mask,
                     template=template,
@@ -1176,39 +1234,70 @@ def load_or_make_run_noise_roi_set(
                     pick_lin=pick_lin,
                     seed=int(seed),
                 )
-                run_noise[(rid, rep_idx)] = arr
+                run_noise_full[(rid, rep_idx)] = arr_full
+                run_noise[(rid, rep_idx)] = arr_full[:T_needed]
         else:
             with ProcessPoolExecutor(max_workers=int(n_parallel)) as ex:
                 futs = []
                 for rid, rep_idx, n_scans, seed in tasks:
-                    futs.append(ex.submit(_generate_one_noise_rep_roi, int(rep_idx), int(n_scans), float(TR), brain_mask, template, noise_dict, pick_lin, int(seed)))
+                    T_needed = int(n_scans)
+                    T_gen = _headroom_T(T_needed)
+                    futs.append(ex.submit(_generate_one_noise_rep_roi, int(rep_idx), int(T_gen), float(TR), brain_mask, template, noise_dict, pick_lin, int(seed)))
                 for (rid, rep_idx, n_scans, seed), fut in zip(tasks, futs):
-                    run_noise[(rid, rep_idx)] = fut.result()
+                    T_needed = int(n_scans)
+                    arr_full = fut.result()
+                    run_noise_full[(rid, rep_idx)] = arr_full
+                    run_noise[(rid, rep_idx)] = arr_full[:T_needed]
 
     # Persist any newly generated arrays
     if use_cache:
         for (rid, rep_idx), arr in run_noise.items():
-            n_scans = int(arr.shape[0])
-            npz_path, meta_path = _paths_for(rid, rep_idx, n_scans)
-            if not npz_path.exists():
-                np.savez_compressed(npz_path, noise_2d=arr.astype(np.float32))
-                meta = {
-                    "key": key,
-                    "dataset_id": dataset_id,
-                    "noise_nii_path": str(noise_nii_path),
-                    "TR": float(TR),
-                    "n_vox": int(n_vox),
-                    "n_scans": int(n_scans),
-                    "run_id": str(rid),
-                    "rep_idx": int(rep_idx),
-                    "pick_lin_hash": _stable_hash(pick_lin.tobytes())[:16],
-                    "noise_cache_seed": int(noise_cache_seed),
-                    "noise_dict": noise_dict,
-                }
+            # Always persist the *cached* (potentially headroom) noise into the single canonical file.
+            # If a shorter/invalid file exists, overwrite it.
+            npz_path, meta_path = _paths_for(rid, rep_idx)
+
+            # Prefer writing the full headroom array if we generated it this call.
+            arr_to_write = run_noise_full.get((rid, rep_idx), arr)
+
+            # Load existing (if any) to decide whether overwrite is necessary
+            need_write = True
+            if npz_path.exists():
                 try:
-                    meta_path.write_text(json.dumps(meta, indent=2))
+                    dat = np.load(npz_path)
+                    cur = dat["noise_2d"].astype(np.float32)
+                    T_cached = int(dat["T_cached"]) if "T_cached" in dat.files else int(cur.shape[0])
+                    need_write = not (
+                        int(cur.shape[0]) == int(T_cached)
+                        and int(cur.shape[1]) == int(n_vox)
+                        and int(cur.shape[0]) >= int(arr_to_write.shape[0])
+                    )
                 except Exception:
-                    pass
+                    need_write = True
+
+            if need_write:
+                np.savez_compressed(
+                    npz_path,
+                    noise_2d=arr_to_write.astype(np.float32),
+                    T_cached=int(arr_to_write.shape[0]),
+                )
+
+            meta = {
+                "key": key,
+                "dataset_id": dataset_id,
+                "noise_nii_path": str(noise_nii_path),
+                "TR": float(TR),
+                "n_vox": int(n_vox),
+                "T_cached": int(arr_to_write.shape[0]),
+                "run_id": str(rid),
+                "rep_idx": int(rep_idx),
+                "pick_lin_hash": _stable_hash(pick_lin.tobytes())[:16],
+                "noise_cache_seed": int(noise_cache_seed),
+                "noise_dict": noise_dict,
+            }
+            try:
+                meta_path.write_text(json.dumps(meta, indent=2))
+            except Exception:
+                pass
 
     meta = {
         "key": key,
