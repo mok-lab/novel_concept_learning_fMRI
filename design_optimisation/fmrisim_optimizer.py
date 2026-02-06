@@ -2400,6 +2400,86 @@ def evaluate_design_stage1(df: pd.DataFrame,
 
     return out
 
+
+def _run_stage2_from_stage1(out_dir: Path, stage1_df: "pd.DataFrame", args, topk: int, *, n_reps_stage2: int = 1) -> None:
+    """Run Stage-2 (fmrisim recoverability) for the top-K designs from an existing stage1_results.csv DataFrame.
+
+    This is implemented via subprocess calls back into this script (non-optimiser mode) to reuse the fmrisim
+    simulation pipeline and avoid duplicating logic.
+    """
+    k = int(topk)
+    if k <= 0:
+        return
+    if stage1_df is None or len(stage1_df) == 0:
+        raise ValueError("stage1_results.csv is empty; nothing to run for stage-2.")
+    if "csv" not in stage1_df.columns:
+        raise ValueError("stage1_results.csv missing required column: 'csv'")
+
+    # Preserve current ordering; if an explicit rank exists, respect it for determinism.
+    if "rank_stage1" in stage1_df.columns:
+        stage1_df = stage1_df.sort_values("rank_stage1", kind="mergesort").reset_index(drop=True)
+
+    k = min(k, int(len(stage1_df)))
+    print(f"[optimiser] Running recoverability (fmrisim) for top {k} designs...")
+
+    import subprocess, sys as _sys
+
+    stage2_rows = []
+    for rank in range(k):
+        csv_path = str(stage1_df.iloc[rank]["csv"])
+        cand_out = out_dir / "stage2_fmrisim" / f"rank{rank:04d}"
+        ensure_dir(cand_out)
+
+        cmd = [
+            _sys.executable, _sys.argv[0],
+            "--csv", csv_path,
+            "--patterns_npz", str(args.patterns_npz),
+            "--noise_nii", str(args.noise_nii),
+            "--TR", str(args.TR),
+            "--hp_cutoff", str(args.hp_cutoff),
+            "--pad_s", str(args.pad_s),
+            "--dec_dur_s", str(args.dec_dur_s),
+            "--temporal_resolution", str(args.temporal_resolution),
+            "--loc_space", str(args.loc_space),
+            "--roi_target_vox", str(args.roi_target_vox),
+            "--n_vox", str(args.n_vox),
+            "--out_dir", str(cand_out),
+            "--n_reps", str(int(n_reps_stage2)),
+        ]
+
+        # Pass through noise caching options if provided
+        if getattr(args, "cache_noise_dict", False):
+            cmd.append("--cache_noise_dict")
+        if getattr(args, "cache_run_noise", False):
+            cmd.append("--cache_run_noise")
+        if getattr(args, "noise_cache_seed", None) is not None:
+            cmd.extend(["--noise_cache_seed", str(args.noise_cache_seed)])
+        if getattr(args, "noise_cache_dir", None) is not None:
+            cmd.extend(["--noise_cache_dir", str(args.noise_cache_dir)])
+
+        subprocess.run(cmd, check=True)
+
+        rec_path = Path(cand_out) / "recovery_summary.csv"
+        if rec_path.exists():
+            summ = pd.read_csv(rec_path)
+            stage2_rows.append({
+                "rank_stage1": rank,
+                "lsa_mean": float(summ["lsa_mean"].mean()) if "lsa_mean" in summ.columns else float("nan"),
+                "lss_mean": float(summ["lss_mean"].mean()) if "lss_mean" in summ.columns else float("nan"),
+                "rsa_anchor_lsa_mean": float(summ["rsa_anchor_lsa_mean"].mean()) if "rsa_anchor_lsa_mean" in summ.columns else float("nan"),
+            })
+        else:
+            stage2_rows.append({
+                "rank_stage1": rank,
+                "lsa_mean": float("nan"),
+                "lss_mean": float("nan"),
+                "rsa_anchor_lsa_mean": float("nan"),
+            })
+
+    pd.DataFrame(stage2_rows).to_csv(out_dir / "stage2_recoverability.csv", index=False)
+
+
+
 def optimise_designs(args) -> None:
     """
     Evolutionary search over jitter distributions/ranges to optimise:
@@ -2416,6 +2496,20 @@ def optimise_designs(args) -> None:
 
     out_dir = Path(args.opt_out_dir)
     ensure_dir(out_dir)
+
+    # Stage-2 only mode: reuse existing stage1_results.csv without rerunning Stage-1.
+    if getattr(args, "stage2_only", False):
+        if int(getattr(args, "stage2_topk", 0)) <= 0:
+            raise ValueError("--stage2_only requires --stage2_topk > 0")
+        stage1_csv = out_dir / "stage1_results.csv"
+        if not stage1_csv.exists():
+            raise FileNotFoundError(f"--stage2_only was set but stage1_results.csv was not found at: {stage1_csv}")
+        stage1_df_existing = pd.read_csv(stage1_csv)
+        if len(stage1_df_existing) == 0:
+            raise ValueError(f"stage1_results.csv is empty: {stage1_csv}")
+        _run_stage2_from_stage1(out_dir, stage1_df_existing, args, int(args.stage2_topk), n_reps_stage2=1)
+        return
+
 
     # Bounds for search: default derived from template unless user overrides
     isi_min_obs = float(min(template["isi1_dur"].min(), template["isi2_dur"].min()))
@@ -2610,64 +2704,10 @@ def optimise_designs(args) -> None:
     stage1_df = pd.DataFrame(rows)
     stage1_df.to_csv(out_dir / "stage1_results.csv", index=False)
 
+
     # Optional: run recoverability on top-K
     if int(args.stage2_topk) > 0:
-        k = min(int(args.stage2_topk), len(top))
-        print(f"[optimiser] Running recoverability (fmrisim) for top {k} designs...")
-        stage2_rows = []
-        for rank in range(k):
-            csv_path = rows[rank]["csv"]
-            cand_out = out_dir / "stage2_fmrisim" / f"rank{rank:04d}"
-            ensure_dir(cand_out)
-
-            # Call this script (without optimiser) via subprocess to reuse the existing simulation pipeline.
-            # This avoids duplicating the full fmrisim pipeline code inside the optimiser.
-            import subprocess, sys as _sys
-
-            cmd = [
-                _sys.executable, _sys.argv[0],
-                "--csv", str(csv_path),
-                "--patterns_npz", str(args.patterns_npz),
-                "--noise_nii", str(args.noise_nii),
-                "--TR", str(args.TR),
-                "--hp_cutoff", str(args.hp_cutoff),
-                "--pad_s", str(args.pad_s),
-                "--dec_dur_s", str(args.dec_dur_s),
-                "--temporal_resolution", str(args.temporal_resolution),
-                "--loc_space", str(args.loc_space),
-                "--roi_target_vox", str(args.roi_target_vox),
-                "--n_vox", str(args.n_vox),
-                "--out_dir", str(cand_out),
-                "--n_reps", "1",
-            ]
-
-            # Pass through noise caching options if provided
-            if getattr(args, "cache_noise_dict", False):
-                cmd.append("--cache_noise_dict")
-            if getattr(args, "cache_run_noise", False):
-                cmd.append("--cache_run_noise")
-            if getattr(args, "noise_cache_seed", None) is not None:
-                cmd.extend(["--noise_cache_seed", str(args.noise_cache_seed)])
-
-            subprocess.run(cmd, check=True)
-
-            rec_path = Path(cand_out) / "recovery_summary.csv"
-            if rec_path.exists():
-                summ = pd.read_csv(rec_path)
-                stage2_rows.append({
-                    "rank_stage1": rank,
-                    "lsa_mean": float(summ["lsa_mean"].mean()) if "lsa_mean" in summ.columns else float("nan"),
-                    "lss_mean": float(summ["lss_mean"].mean()) if "lss_mean" in summ.columns else float("nan"),
-                    "rsa_anchor_lsa_mean": float(summ["rsa_anchor_lsa_mean"].mean()) if "rsa_anchor_lsa_mean" in summ.columns else float("nan"),
-                })
-            else:
-                stage2_rows.append({
-                    "rank_stage1": rank,
-                    "lsa_mean": float("nan"),
-                    "lss_mean": float("nan"),
-                    "rsa_anchor_lsa_mean": float("nan"),
-                })
-        pd.DataFrame(stage2_rows).to_csv(out_dir / "stage2_recoverability.csv", index=False)
+        _run_stage2_from_stage1(out_dir, stage1_df, args, int(args.stage2_topk), n_reps_stage2=1)
 
 
 # ------------------------
@@ -3342,6 +3382,9 @@ def main():
     ap.add_argument("--w_cov", type=float, default=1.0, help="Overall objective weight on TR coverage.")
     ap.add_argument("--stage2_topk", type=int, default=0,
                     help="If >0, run fmrisim recoverability for the top-K designs via subprocess (slow).")
+    ap.add_argument("--stage2_only", action="store_true",
+                    help="Run ONLY stage-2 using an existing <opt_out_dir>/stage1_results.csv (skip stage-1). "
+                         "Requires --stage2_topk > 0.")
     ap.add_argument("--cache_noise_dict", action="store_true",
                 help="Cache the fmrisim noise_dict (from calc_noise) to disk so subsequent runs load it.")
     ap.add_argument("--cache_run_noise", action="store_true",
