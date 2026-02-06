@@ -2426,7 +2426,7 @@ def _run_stage2_from_stage1(out_dir: Path, stage1_df: "pd.DataFrame", args, topk
 
     stage2_rows = []
     for rank in range(k):
-        csv_path = str(stage1_df.iloc[rank]["csv"])
+        csv_path = _normalize_design_csv_path(stage1_df.iloc[rank]["csv"], out_dir)
         cand_out = out_dir / "stage2_fmrisim" / f"rank{rank:04d}"
         ensure_dir(cand_out)
 
@@ -2709,6 +2709,40 @@ def optimise_designs(args) -> None:
     if int(args.stage2_topk) > 0:
         _run_stage2_from_stage1(out_dir, stage1_df, args, int(args.stage2_topk), n_reps_stage2=1)
 
+
+def _normalize_design_csv_path(p_str: str, out_dir: Path) -> Path:
+    """
+    Convert path strings stored in stage1_results.csv into a valid Path on this OS.
+    Handles:
+      - Windows backslashes in CSV when running on Linux
+      - relative paths
+      - fallback to out_dir/designs/<basename>
+    """
+    if not isinstance(p_str, str) or not p_str.strip():
+        raise ValueError("Empty design csv path in stage1_results.csv")
+
+    s = p_str.strip()
+
+    # If we are not on Windows, convert backslashes to forward slashes
+    if os.name != "nt":
+        s = s.replace("\\", "/")
+
+    p = Path(s)
+
+    # Resolve relative paths against current working dir first
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+
+    if p.exists():
+        return p
+
+    # Fallback: assume file was written into <opt_out_dir>/designs/
+    fallback = (out_dir / "designs" / Path(s).name).resolve()
+    if fallback.exists():
+        return fallback
+
+    # Final: return the best guess (for better error messages)
+    return p
 
 # ------------------------
 # GUI: Candidate design bank generator (Stage-1 ranking) + optional Stage-2
