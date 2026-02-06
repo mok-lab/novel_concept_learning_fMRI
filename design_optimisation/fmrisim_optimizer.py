@@ -2522,7 +2522,7 @@ def optimise_designs(args) -> None:
         stage1_df_existing = pd.read_csv(stage1_csv)
         if len(stage1_df_existing) == 0:
             raise ValueError(f"stage1_results.csv is empty: {stage1_csv}")
-        _run_stage2_from_stage1(out_dir, stage1_df_existing, args, int(args.stage2_topk), n_reps_stage2=1)
+        _run_stage2_from_stage1(out_dir, stage1_df_existing, args, int(args.stage2_topk), n_reps_stage2=int(getattr(args, 'n_reps', 1)))
         return
 
 
@@ -3337,7 +3337,13 @@ def main():
                     help="Interactive plot of true voxel responses (encoding/decision/feedback) for rep 0.")
     ap.add_argument("--plot_run_id", default=None,
                     help="If provided, plot only this run_id (default: first run) when --plot_true is set.")
-   
+    ap.add_argument(
+        "--noise_cache_parent",
+        type=str,
+        default=None,
+        help="Optional parent directory for all noise caches (shared across candidates). "
+             "If not set, caches default to each run's --out_dir (legacy behavior)."
+    )
 
     ap.add_argument("--TR", type=float, required=True)
     ap.add_argument("--hp_cutoff", type=float, default=128.0)
