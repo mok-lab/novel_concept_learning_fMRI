@@ -3337,13 +3337,6 @@ def main():
                     help="Interactive plot of true voxel responses (encoding/decision/feedback) for rep 0.")
     ap.add_argument("--plot_run_id", default=None,
                     help="If provided, plot only this run_id (default: first run) when --plot_true is set.")
-    ap.add_argument(
-        "--noise_cache_parent",
-        type=str,
-        default=None,
-        help="Optional parent directory for all noise caches (shared across candidates). "
-             "If not set, caches default to each run's --out_dir (legacy behavior)."
-    )
 
     ap.add_argument("--TR", type=float, required=True)
     ap.add_argument("--hp_cutoff", type=float, default=128.0)
