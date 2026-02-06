@@ -657,6 +657,17 @@ def convolve_to_TR(stim, TR, tres, n_scans, hrf_type='double_gamma'):
     out[:L] = sig[:L, 0]
     return out
 
+def _get_noise_cache_root(args, out_dir: Path) -> Path:
+    """
+    Return the directory under which noise caches should be stored.
+    Backward compatible: defaults to out_dir (old behavior).
+    """
+    if getattr(args, "noise_cache_parent", None):
+        root = Path(args.noise_cache_parent).expanduser()
+    else:
+        root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 def generate_noise_volume(noise_dict: Dict, mask3d: np.ndarray, template3d: np.ndarray, n_scans: int, TR: float) -> np.ndarray:
     """Generate 4D noise using the *documented* BrainIAK fmrisim API.
@@ -946,7 +957,7 @@ def load_or_make_noise_dict(vol4d: np.ndarray, noise_nii_path: str, TR: float, c
 
     Returns (noise_dict, brain_mask, template).
     """
-    cache_dir.mkdir(parents=True, exist_ok=True)
+
 
     # mask + template per docs
     brain_mask, template = fmrisim.mask_brain(volume=vol4d, mask_self=True)
@@ -2454,8 +2465,12 @@ def _run_stage2_from_stage1(out_dir: Path, stage1_df: "pd.DataFrame", args, topk
             cmd.append("--cache_run_noise")
         if getattr(args, "noise_cache_seed", None) is not None:
             cmd.extend(["--noise_cache_seed", str(args.noise_cache_seed)])
-        if getattr(args, "noise_cache_dir", None) is not None:
+
+        # Ensure stage-2 subprocesses share the same noise cache if requested
+        if getattr(args, "noise_cache_dir", None):
             cmd.extend(["--noise_cache_dir", str(args.noise_cache_dir)])
+        if getattr(args, "noise_cache_parent", None):
+            cmd.extend(["--noise_cache_parent", str(args.noise_cache_parent)])
 
         subprocess.run(cmd, check=True)
 
@@ -3322,6 +3337,13 @@ def main():
                     help="Interactive plot of true voxel responses (encoding/decision/feedback) for rep 0.")
     ap.add_argument("--plot_run_id", default=None,
                     help="If provided, plot only this run_id (default: first run) when --plot_true is set.")
+    ap.add_argument(
+        "--noise_cache_parent",
+        type=str,
+        default=None,
+        help="Optional parent directory for all noise caches (shared across candidates). "
+             "If not set, caches default to each run's --out_dir (legacy behavior)."
+    )
 
     ap.add_argument("--TR", type=float, required=True)
     ap.add_argument("--hp_cutoff", type=float, default=128.0)
@@ -3427,6 +3449,11 @@ def main():
                 help="Seed used for deterministic voxel sampling when caching run noise.")
     ap.add_argument("--noise_cache_dir", default=None,
                 help="Optional directory for noise cache. Default: <out_dir>/noise_cache")
+    ap.add_argument("--noise_cache_parent", default=None,
+                help="Optional parent directory for ALL noise-related caches. "
+                     "If set, caches are stored under <noise_cache_parent>/noise/<dataset_id> unless --noise_cache_dir overrides. "
+                     "This is useful for stage-2 subprocess runs so all candidates reuse the same noise cache.")
+
 
     # Backwards-compatible / deprecated args (ignored in this doc-faithful pipeline)
     ap.add_argument("--noise_mask", default=None,
@@ -3478,11 +3505,13 @@ def main():
     design_group = infer_design_group_from_csv(Path(args.csv))
     out_dir = ensure_dir(base_out_dir / design_group)
 
-    # Shared noise cache lives under base_out_dir/noise/<dataset_id> by default (cross-design reuse)
+    # Shared noise cache lives under <noise_cache_parent>/noise/<dataset_id> if provided,
+    # otherwise under base_out_dir/noise/<dataset_id> (cross-design reuse).
     dataset_id = infer_dataset_id_from_noise_path(args.noise_nii)
-    noise_root = ensure_dir(base_out_dir / "noise" / dataset_id)
+    noise_parent = Path(args.noise_cache_parent) if getattr(args, "noise_cache_parent", None) else base_out_dir
+    noise_root = ensure_dir(noise_parent / "noise" / dataset_id)
 
-    # Allow override for all noise-related caches
+    # Allow explicit override for all noise-related caches
     cache_dir = Path(args.noise_cache_dir) if args.noise_cache_dir else noise_root
 
     noise_dict, brain_mask, template = load_or_make_noise_dict(
