@@ -6,7 +6,8 @@
 
 # Large task images
 images/task_images/
-
+images/images_THINGS/
+*token.txt
 # Any frmi Files
 *.nii
 # User-specific files
