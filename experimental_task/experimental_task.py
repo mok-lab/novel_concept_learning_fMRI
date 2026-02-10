@@ -661,6 +661,7 @@ def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_
 
 
 def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mode, feedback_delay,
+                     fixed_decision_time,
                      task_clock=None, trial_idx=1, n_trials=1):
     """3-event (self-paced) trial.
 
@@ -721,8 +722,10 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
 
     # 2) Decision (self-paced)
     t_dec = clock.getTime()
+    dec_end = t_dec + max_dec_dur
     response_made, rt = None, None
-    while clock.getTime() < (t_dec + max_dec_dur):
+
+    while clock.getTime() < dec_end:
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
         if _demo_skip_pressed(demo_mode):
@@ -732,34 +735,35 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
 
         if response_made is None:
             response_made, rt = check_response(components, clock, t_dec)
-            if response_made:
-                # Draw one last frame with the selected option, then move on immediately
+            if response_made and (not fixed_decision_time):
+                # Self-paced advance: show selection for one frame then move on immediately
                 draw_buttons(components['buttons'], response_made)
 
                 breakdown = [
-                    f"Dec: {max(0.0, (t_dec + max_dec_dur) - clock.getTime()):4.1f}s",
+                    f"Dec: {max(0.0, dec_end - clock.getTime()):4.1f}s",
                     f"ISI2: {isi2_dur:4.1f}s" if feedback_delay else "ISI2: 0.0s",
                     f"Fb : {fb_dur:4.1f}s",
                     f"ITI: {iti:4.1f}s",
                 ]
                 _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials,
-                                  clock, trial_t0, 'Decision', (t_dec + max_dec_dur), breakdown)
+                                  clock, trial_t0, 'Decision', dec_end, breakdown)
                 win.flip()
                 break
 
+        # In fixed decision-time mode, keep the decision screen up until dec_end,
+        # even if a response was already made.
         draw_buttons(components['buttons'], response_made)
 
         breakdown = [
-            f"Dec: {max(0.0, (t_dec + max_dec_dur) - clock.getTime()):4.1f}s",
+            f"Dec: {max(0.0, dec_end - clock.getTime()):4.1f}s",
             f"ISI2: {isi2_dur:4.1f}s" if feedback_delay else "ISI2: 0.0s",
             f"Fb : {fb_dur:4.1f}s",
             f"ITI: {iti:4.1f}s",
         ]
         _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials,
-                          clock, trial_t0, 'Decision', (t_dec + max_dec_dur), breakdown)
+                          clock, trial_t0, 'Decision', dec_end, breakdown)
         win.flip()
-
-    # 3) Optional hidden ISI2 delay (keep image + selected button on screen)
+# 3) Optional hidden ISI2 delay (keep image + selected button on screen)
     if feedback_delay and response_made:
         t_isi2 = clock.getTime()
         while clock.getTime() < (t_isi2 + isi2_dur):
@@ -958,6 +962,7 @@ def run_experiment():
         'Label CSV': '',         # Leave blank to browse
         'Image Dir': 'images/task_images/',   # Default directory
         'Feedback Delay': False, # Selection from previous requirements
+        'Fixed Decision Time': True,  # When True, always wait max_dec_dur before ISI2/Feedback
         'Demo Mode': False,
         # Tickbox: when True use scanner button mapping (1-4). When False use PC mapping (1,2,9,0)
         'Scanner Buttons': True
@@ -975,7 +980,7 @@ def run_experiment():
     dlg = gui.DlgFromDict(
         info,
         title='Study 3 Launcher',
-        order=['Sub', 'Design CSV', 'Label CSV', 'Image Dir', 'Feedback Delay', 'Demo Mode', 'Scanner Buttons'],
+        order=['Sub', 'Design CSV', 'Label CSV', 'Image Dir', 'Feedback Delay', 'Fixed Decision Time', 'Demo Mode', 'Scanner Buttons'],
         tip={
             'Design CSV': 'Leave blank to open file browser',
             'Label CSV': 'Leave blank to open file browser',
@@ -1013,6 +1018,7 @@ def run_experiment():
 
     demo_mode = _to_bool(info.get('Demo Mode'))
     feedback_delay = _to_bool(info.get('Feedback Delay'))
+    fixed_decision_time = _to_bool(info.get('Fixed Decision Time'))
     # Determine button mapping based on scanner toggle (default: scanner mapping)
     use_scanner_buttons = _to_bool(info.get('Scanner Buttons'))
     # Update global keys mapping so other functions use the selected mapping
@@ -1101,7 +1107,8 @@ while others will not. \n\nThe names of the objects won't change during the expe
             else:
                 res = run_trial_3event(
                     win, run_clock, trial, components, label_data, info['Image Dir'],
-                    demo_mode, feedback_delay, task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials
+                    demo_mode, feedback_delay, fixed_decision_time,
+                    task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials
                 )
 
             row = dict(trial)
