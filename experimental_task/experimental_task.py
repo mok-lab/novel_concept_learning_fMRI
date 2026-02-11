@@ -107,37 +107,64 @@ def load_label_map(csv_path, key_col='ObjectSpace'):
 def build_participant_label_pool(design_df, label_map, space_col_candidates=('ObjectSpace','group')):
     """Build a restricted distractor pool for this participant.
 
-    The pool is limited to labels belonging to ObjectSpaces that actually appear in the
-    participant's design CSV. This reduces the chance of presenting distractors from
-    object spaces the participant never sees, which could be confusing.
+    The pool is limited to labels that can actually occur for this participant, based on
+    the participant's design CSV.
 
-    If no recognized space column exists in the design file the function falls back to
-    returning all labels from the label_map (safe default).
+    Primary behaviour (new, more precise):
+      - If the design file contains both a recognizable space column AND a 'condition'
+        column, the pool is built from the *actual (space, condition)* pairs that appear
+        in the design. This ensures distractors are sampled from labels the participant
+        truly encounters in the task.
+
+    Fallback behaviour (preserves prior robustness):
+      - If no space column exists, or no condition column exists, or no labels can be
+        resolved from the design, the function falls back to using all labels from the
+        label_map (safe default).
     """
     space_col = None
     for c in space_col_candidates:
         if c in design_df.columns:
             space_col = c
             break
-    if space_col is None:
-        # Fallback: use all labels when the design has no recognizable space column
+
+    cond_col = 'condition' if 'condition' in design_df.columns else None
+
+    # If we have both space + condition, restrict to labels used by actual pairs
+    if space_col is not None and cond_col is not None:
         pool = set()
-        for d in label_map.values():
-            pool.update(d.values())
-        return sorted(pool)
+        # Use unique (space, condition) pairs to avoid repeated work
+        pairs = design_df[[space_col, cond_col]].dropna()
+        for _, row in pairs.drop_duplicates().iterrows():
+            s = str(row[space_col])
+            cond = str(row[cond_col])
+            lbl = label_map.get(s, {}).get(cond, None)
+            if lbl is None:
+                continue
+            # guard against NaN-like values and the explicit sentinel
+            if isinstance(lbl, float) and np.isnan(lbl):
+                continue
+            lbl = str(lbl).strip()
+            if not lbl or lbl.upper() == 'MISSING':
+                continue
+            pool.add(lbl)
+        if pool:
+            return sorted(pool)
 
-    # Gather unique space identifiers present in the design file
-    spaces = set(str(x) for x in design_df[space_col].dropna().astype(str).tolist())
+    # Fallback: previous behaviour (space-only) if possible
+    if space_col is not None:
+        spaces = set(str(x) for x in design_df[space_col].dropna().astype(str).tolist())
+        pool = set()
+        for s in spaces:
+            if s in label_map:
+                pool.update(label_map[s].values())
+        if pool:
+            return sorted(pool)
+
+    # Final fallback: use all labels
     pool = set()
-    for s in spaces:
-        if s in label_map:
-            pool.update(label_map[s].values())
-    # If nothing matched (e.g., formatting mismatch), fallback to all labels
-    if not pool:
-        for d in label_map.values():
-            pool.update(d.values())
+    for d in label_map.values():
+        pool.update(d.values())
     return sorted(pool)
-
 
 def calculate_lengths(df):
     """Return a human-readable total duration string for the design.
@@ -248,6 +275,60 @@ def split_into_runs(design_df, run_col):
     return [(rv, design_df[design_df[run_col] == rv].copy()) for rv in run_values]
 
 
+
+
+def generate_balanced_button_sequence(n_trials, n_buttons=4, max_repeat=2, rng=None):
+    """Generate a per-run sequence of correct-button indices.
+
+    Goals:
+      - Counterbalance correct option positions within a run (counts differ by at most 1).
+      - Avoid placing the correct option on the same button more than `max_repeat` times in a row.
+      - Keep behaviour deterministic if the caller passes a seeded `rng`.
+
+    Returns:
+      list[int]: length n_trials, values in [0, n_buttons-1]
+    """
+    if rng is None:
+        rng = random
+
+    if n_trials <= 0:
+        return []
+
+    # Distribute counts as evenly as possible across buttons
+    base = n_trials // n_buttons
+    rem = n_trials % n_buttons
+    counts = [base] * n_buttons
+    # Randomize which buttons get the extra 1 to avoid systematic bias
+    extra_buttons = list(range(n_buttons))
+    rng.shuffle(extra_buttons)
+    for i in range(rem):
+        counts[extra_buttons[i]] += 1
+
+    # Greedy with light backtracking: pick among eligible buttons with remaining counts.
+    seq = []
+    last = []
+    for _ in range(n_trials):
+        # Eligible buttons: remaining > 0 and not violating max_repeat constraint
+        eligible = [i for i in range(n_buttons) if counts[i] > 0]
+        if max_repeat is not None and max_repeat > 0 and len(last) >= max_repeat:
+            if all(x == last[-1] for x in last[-max_repeat:]):
+                eligible = [i for i in eligible if i != last[-1]]
+
+        if not eligible:
+            # Rare corner: restart with a fresh random distribution until feasible
+            # (n_buttons=4 and max_repeat=2 makes this extremely unlikely to loop).
+            return generate_balanced_button_sequence(n_trials, n_buttons=n_buttons, max_repeat=max_repeat, rng=rng)
+
+        # Choose the button with the highest remaining count; random tie-break for balance
+        max_c = max(counts[i] for i in eligible)
+        top = [i for i in eligible if counts[i] == max_c]
+        choice = rng.choice(top)
+
+        seq.append(choice)
+        counts[choice] -= 1
+        last.append(choice)
+
+    return seq
 def between_run_dialog(next_run_idx, run_label=None):
     """Native GUI dialog shown between runs (outside fullscreen).
 
@@ -268,7 +349,7 @@ def between_run_dialog(next_run_idx, run_label=None):
 
 # =========================== VISUAL HELPERS =========================== #
 
-def show_instruction_screen(win, text_content, image_path=None):
+def show_instruction_screen(win, text_content, image_path=None, use_scanner_buttons=False):
     """
     Standardized instruction screen with optional image.
     Anchored to relative height units for cross-screen compatibility.
@@ -285,7 +366,10 @@ def show_instruction_screen(win, text_content, image_path=None):
     text_y = Y_INSTR_TEXT_HIGH if image_path else Y_INSTR_TEXT_MID
     msg = visual.TextStim(win, text=text_content, color='black', height=0.035, 
                           wrapWidth=0.8, pos=(0, text_y))
-    cont_msg = visual.TextStim(win, text="Press SPACE bar to continue", 
+    cont_text = "Press SPACE bar to continue"
+    if use_scanner_buttons:
+        cont_text = "Press the rightmost button to continue"
+    cont_msg = visual.TextStim(win, text=cont_text,
                                pos=(0, Y_SPACE_PROMPT), color='grey', height=0.025)
     
     img_stim = None
@@ -300,8 +384,12 @@ def show_instruction_screen(win, text_content, image_path=None):
             img_stim.draw()
         cont_msg.draw()
         win.flip()
-        # Block until space pressed to ensure participant reads instructions
-        if 'space' in event.getKeys():
+        # Block until the continue key is pressed to ensure participant reads instructions
+        cont_key = 'space'
+        if use_scanner_buttons:
+            # In scanner mode we use the rightmost response button to continue
+            cont_key = '4'
+        if cont_key in event.getKeys():
             break
 
 
@@ -357,7 +445,7 @@ def draw_buttons_feedback(buttons, response_made, correct_key):
         btn['text'].draw()
 
 
-def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode):
+def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode, target_button_idx=None):
     """Common setup logic for both timing modes.
 
     Responsibilities:
@@ -398,7 +486,27 @@ def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode):
             distractors.append("NA")
 
     choices = [target_lbl] + distractors
-    random.shuffle(choices)
+    # By default, keep the original behaviour: shuffle choice order freely.
+    # If a target button index is provided, place the target label on that button
+    # and shuffle only the distractors across the remaining buttons.
+    if target_button_idx is None:
+        random.shuffle(choices)
+    else:
+        try:
+            tb = int(target_button_idx)
+        except Exception:
+            tb = None
+        if tb is None or tb < 0 or tb >= len(KEYS_RESP):
+            random.shuffle(choices)
+        else:
+            choices_fixed = [None] * len(KEYS_RESP)
+            choices_fixed[tb] = target_lbl
+            other_idx = [i for i in range(len(KEYS_RESP)) if i != tb]
+            distractors_shuf = distractors[:]
+            random.shuffle(distractors_shuf)
+            for i, bi in enumerate(other_idx):
+                choices_fixed[bi] = distractors_shuf[i] if i < len(distractors_shuf) else ""
+            choices = choices_fixed
 
     # Apply choices to button text
     for i, btn in enumerate(components['buttons']):
@@ -507,14 +615,14 @@ def _return_skipped(img_path):
 # =========================== TRIALS =========================== #
 
 def run_trial_standard(win, clock, trial, components, label_data, img_dir, demo_mode,
-                       task_clock=None, trial_idx=1, n_trials=1):
+                       task_clock=None, trial_idx=1, n_trials=1, target_button_idx=None):
     """Restored 2-Event Logic with new visuals.
 
     Standard mode timeline is absolute: onsets in the design CSV are respected
     relative to a run clock. This function loops through phases using the
     provided PsychoPy clock to maintain precise timing.
     """
-    has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode)
+    has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode, target_button_idx=target_button_idx)
 
     # Identify correct key
     try:
@@ -676,7 +784,7 @@ def run_trial_3event(win, clock, trial, components, label_data, img_dir, demo_mo
     supports a self-paced decision phase where the trial advances immediately
     after a response (useful for reaction-time based tasks).
     """
-    has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode)
+    has_img, img_path, target, choices = setup_trial_visuals(trial, components, label_data, img_dir, demo_mode, target_button_idx=target_button_idx)
 
     # Identify correct key based on shuffled choices
     try:
@@ -1062,18 +1170,23 @@ def run_experiment():
     # Create first fullscreen window and start as-is (run 1 unchanged)
     win, components = create_window_and_components(demo_mode)
     # Show initial experimental instructions
-    # Nicely format the currently active response keys for the instruction text
-    keys_str = ", ".join(f"'{k}'" for k in KEYS_RESP)
+    # In scanner mode, do NOT mention specific key numbers on instruction screens.
+    if use_scanner_buttons:
+        hand_text = "Keep your fingers placed on the response buttons."
+    else:
+        keys_str = ", ".join(f"'{k}'" for k in KEYS_RESP)
+        hand_text = f"Keep your fingers placed on the {keys_str} keys."
+
     show_instruction_screen(win, (
         "EXPERIMENTAL SESSION\n\n"
         "You are about to start the main task.\n"
         "Remember to categorize the objects as accurately as possible.\n\n"
-        f"Keep your fingers placed on the {keys_str} keys."
-    ), image_path="instruction_image_1.png")
+        f"{hand_text}"
+    ), image_path="instruction_image_1.png", use_scanner_buttons=use_scanner_buttons)
     show_instruction_screen(win, (
         "The objects you are going to learn are from an alien planet. Some of them can look similar to one's you've seen before\
 while others will not. \n\nThe names of the objects won't change during the experiment."
-    ))
+    ), use_scanner_buttons=use_scanner_buttons)
     trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=n_runs, run_label=runs[0][0])
 
     for run_idx, (run_label, run_df) in enumerate(runs, start=1):
@@ -1096,19 +1209,23 @@ while others will not. \n\nThe names of the objects won't change during the expe
 
         trials = run_df.to_dict('records')
         n_trials = len(trials)
+        # Counterbalance correct-option button position within this run
+        target_btn_seq = generate_balanced_button_sequence(n_trials, n_buttons=len(KEYS_RESP), max_repeat=2, rng=random)
         run_rows = []  # per-run buffer for crash-safe saving
 
         for trial_idx, trial in enumerate(trials, start=1):
             if mode == 'standard':
                 res = run_trial_standard(
                     win, run_clock, trial, components, label_data, info['Image Dir'],
-                    demo_mode, task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials
+                    demo_mode, task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials,
+                    target_button_idx=target_btn_seq[trial_idx-1]
                 )
             else:
                 res = run_trial_3event(
                     win, run_clock, trial, components, label_data, info['Image Dir'],
                     demo_mode, feedback_delay, fixed_decision_time,
-                    task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials
+                    task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials,
+                    target_button_idx=target_btn_seq[trial_idx-1]
                 )
 
             row = dict(trial)
