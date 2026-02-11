@@ -75,7 +75,7 @@ DEFAULT_IMG_TEX_SIZE = 512
 DISPLAY_IMG_HEIGHT_FRAC = 0.60
 
 # Match experimental_task.py look
-BG_COLOR = "white"
+BG_COLOR = "lightgrey"
 FG_COLOR = "black"
 
 SCANNER_KEYS = ["1", "2", "3", "4"]
