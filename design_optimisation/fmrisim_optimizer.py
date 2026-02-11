@@ -3146,7 +3146,7 @@ def launch_candidate_design_gui() -> None:
                         df_new.to_csv(fpath, index=False)
                         wrote += 1
                         self._candidates.append({
-                            "var_idx": v,
+                            "var_idx": var_idx,
                             "iter_idx": it,
                             "seed": seed,
                             "params": params,
