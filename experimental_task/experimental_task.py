@@ -28,6 +28,8 @@ import numpy as np
 import os
 import random
 import re
+import sys
+from datetime import datetime
 
 # =========================== CONFIGURATION =========================== #
 # Keys used by the task. Numeric keys map to response options; TRIGGER_KEY used
@@ -36,6 +38,10 @@ KEYS_RESP = ['1', '2', '9', '0']
 TRIGGER_KEY = '5'
 EXIT_KEY = 'escape'
 SKIP_KEY = 'right'  # Demo Mode only
+
+# Scanner trigger -> first-trial delay (seconds). Implemented as 10s + 15s = 25s total.
+TRIGGER_DELAY_PART1 = 10.0
+TRIGGER_DELAY_PART2 = 15.0
 
 # Colors used for buttons / feedback. Keep names descriptive to make intent clear.
 COL_NEUTRAL   = 'silver'
@@ -1060,6 +1066,84 @@ def _safe_write_csv(df, path):
     os.replace(tmp, path)
 
 
+
+class _TeeStream:
+    """Lightweight stdout/stderr tee to also write console output to a file.
+
+    Uses line-buffered writes and flushes to keep logs readable without heavy overhead.
+    """
+    def __init__(self, *streams):
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+        # Flush on newline to keep file readable in crashes
+        if isinstance(s, str) and ("\n" in s):
+            self.flush()
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+def _freeze_clock_for_io(clock, fn, *args, **kwargs):
+    """Run IO-heavy code without shifting the task's *design clock*.
+
+    In standard mode, trial timing is absolute relative to run_clock. Any delay caused
+    by file IO between trials would otherwise shift subsequent trial onsets. This helper
+    measures the elapsed time spent in `fn` and subtracts it back from the provided clock.
+
+    For non-standard modes this is still harmless and preserves the intended pacing.
+    """
+    if clock is None:
+        return fn(*args, **kwargs)
+
+    try:
+        t0 = clock.getTime()
+    except Exception:
+        return fn(*args, **kwargs)
+
+    out = fn(*args, **kwargs)
+
+    try:
+        t1 = clock.getTime()
+        dt = float(t1 - t0)
+        if dt > 0:
+            clock.addTime(-dt)
+    except Exception:
+        pass
+
+    return out
+
+def _wait_post_trigger_delay(win, components, total_seconds, demo_mode=False):
+    """Show fixation and wait a fixed delay after the scanner trigger."""
+    if total_seconds is None or total_seconds <= 0:
+        return
+
+    # Optional on-screen note in demo mode only (participants shouldn't see extra text)
+    msg = None
+    if demo_mode:
+        msg = visual.TextStim(win, text=f"Post-trigger delay: {total_seconds:.1f}s", pos=(0, 0.35),
+                              height=0.03, color='black')
+
+    clk = core.Clock()
+    clk.reset()
+    event.clearEvents()
+    while clk.getTime() < total_seconds:
+        if event.getKeys(keyList=[EXIT_KEY]):
+            core.quit()
+        components['fixation'].draw()
+        if msg is not None:
+            msg.draw()
+        win.flip()
+
+
 def run_experiment():
     # 1. Start Dialog: basic participant/run configuration
     info = {
@@ -1134,6 +1218,32 @@ def run_experiment():
     else:
         KEYS_RESP = ['1', '2', '9', '0']
 
+    
+    # --------------------------- OUTPUT / LOGGING --------------------------- #
+    # Create a clean, per-participant output folder with a per-session timestamp.
+    session_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    sub_token = str(info['Sub']).strip()
+    base_out_dir = os.path.join('participant_data', f"sub-{sub_token}", f"session-{session_ts}")
+    dir_logs = os.path.join(base_out_dir, "logs")
+    dir_ckpt9 = os.path.join(base_out_dir, "checkpoints_9trials")
+    dir_runs = os.path.join(base_out_dir, "per_run")
+    dir_final = os.path.join(base_out_dir, "final")
+
+    for d in (dir_logs, dir_ckpt9, dir_runs, dir_final):
+        os.makedirs(d, exist_ok=True)
+
+    # Tee all console output to a participant/session log for crash forensics.
+    # Keep it lightweight; writing is line-buffered and shouldn't affect timing.
+    console_log_path = os.path.join(dir_logs, f"console_sub-{sub_token}_{session_ts}.txt")
+    try:
+        _log_fh = open(console_log_path, "a", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStream(sys.__stdout__, _log_fh)
+        sys.stderr = _TeeStream(sys.__stderr__, _log_fh)
+        print(f"[info] Console logging to: {console_log_path}")
+    except Exception as _e:
+        _log_fh = None
+        print(f"[warn] Could not set up console logging: {_e}")
+
     try:
         # Load design and label files and build participant-specific pools
         design_df = pd.read_csv(info['Design CSV'])
@@ -1162,8 +1272,6 @@ def run_experiment():
 
     n_runs = len(runs)
 
-    # Ensure output directory exists early so per-run files can be written safely
-    os.makedirs('participant_data', exist_ok=True)
 
     # Create first fullscreen window and start as-is (run 1 unchanged)
     win, components = create_window_and_components(demo_mode)
@@ -1186,6 +1294,8 @@ def run_experiment():
 while others will not. \n\nThe names of the objects won't change during the experiment."
     ), use_scanner_buttons=use_scanner_buttons)
     trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=n_runs, run_label=runs[0][0])
+    # Wait 10s + 15s (25s) after trigger before the first trial starts (run 1)
+    _wait_post_trigger_delay(win, components, TRIGGER_DELAY_PART1 + TRIGGER_DELAY_PART2, demo_mode=demo_mode)
 
     for run_idx, (run_label, run_df) in enumerate(runs, start=1):
         # Between-run flow (run 2+): close fullscreen -> GUI -> reopen fullscreen -> trigger screen
@@ -1198,6 +1308,8 @@ while others will not. \n\nThe names of the objects won't change during the expe
 
             win, components = create_window_and_components(demo_mode)
             trigger_screen(win, components, mode, demo_mode, run_idx=run_idx, n_runs=n_runs, run_label=run_label)
+            # Wait 10s + 15s (25s) after trigger before the first trial starts (this run)
+            _wait_post_trigger_delay(win, components, TRIGGER_DELAY_PART1 + TRIGGER_DELAY_PART2, demo_mode=demo_mode)
 
         # Reset clocks per run (important for standard-mode absolute onsets)
         run_clock = core.Clock()
@@ -1235,26 +1347,45 @@ while others will not. \n\nThe names of the objects won't change during the expe
             run_rows.append(row)
             out_rows.append(row)
 
+            # Checkpoint save every 9 trials (global, across runs) for crash robustness.
+            # Use _freeze_clock_for_io to avoid shifting the design clock (especially in standard mode).
+            if len(out_rows) % 9 == 0:
+                ckpt_path = os.path.join(dir_ckpt9, f"sub-{sub_token}_{mode}_ckpt-trials-{len(out_rows):05d}_{session_ts}.csv")
+                def _write_ckpt():
+                    ckpt_df = pd.DataFrame(out_rows)
+                    _safe_write_csv(ckpt_df, ckpt_path)
+                _freeze_clock_for_io(run_clock, _write_ckpt)
+
         # Save results for this run immediately (crash-safe).
         # This ensures we still have earlier runs if the task crashes later.
         if len(run_rows) > 0:
-            run_out_df = pd.DataFrame(run_rows)
             run_token = _sanitize_run_label(run_label)
-            run_path = f"participant_data/sub-{info['Sub']}_{mode}_run-{run_idx:02d}_{run_token}.csv"
-            _safe_write_csv(run_out_df, run_path)
+            run_path = os.path.join(dir_runs, f"sub-{sub_token}_{mode}_run-{run_idx:02d}_{run_token}_{session_ts}.csv")
+            def _write_run():
+                run_out_df = pd.DataFrame(run_rows)
+                _safe_write_csv(run_out_df, run_path)
+            _freeze_clock_for_io(run_clock, _write_run)
 
     out_df = pd.DataFrame(out_rows)
     # Final joined file across all runs (crash-safe)
-    joined_path = f"participant_data/sub-{info['Sub']}_{mode}_joined.csv"
-    _safe_write_csv(out_df, joined_path)
+    joined_path = os.path.join(dir_final, f"sub-{sub_token}_{mode}_joined_{session_ts}.csv")
+    _freeze_clock_for_io(None, _safe_write_csv, out_df, joined_path)
     # Also write/keep the legacy filename for compatibility
-    legacy_path = f"participant_data/sub-{info['Sub']}_{mode}.csv"
-    _safe_write_csv(out_df, legacy_path)
+    legacy_path = os.path.join(dir_final, f"sub-{sub_token}_{mode}_{session_ts}.csv")
+    _freeze_clock_for_io(None, _safe_write_csv, out_df, legacy_path)
 
     try:
         win.close()
     except Exception:
         pass
+
+    # Close console log file handle if we created one
+    try:
+        if '_log_fh' in locals() and _log_fh is not None:
+            _log_fh.close()
+    except Exception:
+        pass
+
     core.quit()
 
 if __name__ == "__main__":
