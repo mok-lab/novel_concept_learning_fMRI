@@ -366,7 +366,7 @@ def show_instruction_screen(win, text_content, image_path=None, use_scanner_butt
     # Standardized vertical positions (relative to height 1.0)
     Y_INSTR_TEXT_HIGH = 0.22
     Y_INSTR_TEXT_MID  = 0.10
-    Y_INSTR_IMAGE     = -0.10
+    Y_INSTR_IMAGE     = -0.15
     Y_SPACE_PROMPT    = -0.40
 
     text_y = Y_INSTR_TEXT_HIGH if image_path else Y_INSTR_TEXT_MID
@@ -381,7 +381,7 @@ def show_instruction_screen(win, text_content, image_path=None, use_scanner_butt
     img_stim = None
     if image_path and os.path.exists(image_path):
         # size (0.7, 0.4) provides a large, clear instructional icon
-        img_stim = visual.ImageStim(win, image=image_path, pos=(0, Y_INSTR_IMAGE), size=(0.7, 0.4))
+        img_stim = visual.ImageStim(win, image=image_path, pos=(0, Y_INSTR_IMAGE), size=(0.3, 0.3))
     
     event.clearEvents()
     while True:
@@ -1299,11 +1299,11 @@ def run_experiment():
         "You are about to start the main object learning task.\n"
         "Remember to categorize the objects as accurately and fast as possible.\n\n"
         f"{hand_text}"
-    ), image_path="instruction_image_1.png", use_scanner_buttons=use_scanner_buttons)
+    ), image_path="experimental_task/resources/instruction_image_scanner.png", use_scanner_buttons=use_scanner_buttons)
     show_instruction_screen(win, (
         "The objects you are going to learn are from an alien planet. Some of them can look similar to one's you've seen before \
 while others will not. \n\nThe names of the objects won't change during the experiment."
-    ), use_scanner_buttons=use_scanner_buttons)
+    ), image_path="experimental_task/resources/alien_image.png",use_scanner_buttons=use_scanner_buttons)
     trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=n_runs, run_label=runs[0][0])
     # Wait 10s after trigger before the first trial starts (run 1)
     if enable_trigger_delay:
