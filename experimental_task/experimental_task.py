@@ -40,7 +40,6 @@ EXIT_KEY = 'escape'
 SKIP_KEY = 'right'  # Demo Mode only
 
 # Scanner trigger -> first-trial delay (seconds).
-TRIGGER_DELAY_SECONDS = 10.0
 
 
 # Colors used for buttons / feedback. Keep names descriptive to make intent clear.
@@ -1127,36 +1126,97 @@ def _freeze_clock_for_io(clock, fn, *args, **kwargs):
 
     return out
 
-def _wait_post_trigger_delay(win, components, total_seconds, demo_mode=False):
-    """Wait a fixed delay after the scanner trigger (blank screen).
+def run_fixation_event(win, clock, trial, components, demo_mode, task_clock=None,
+                       trial_idx=1, n_trials=1, mode='standard'):
+    """Render a fixation-only event encoded as a row in the design CSV.
 
-    Rationale:
-      - Gives the scanner time to reach steady state before Trial 1
-      - Uses a blank screen to avoid unintended visual stimulation during the delay
+    The design generator can insert run-start and run-end fixation periods.
+    These events use the existing fixation cross stimulus and do not accept
+    responses.
 
-    Notes:
-      - We keep the function signature stable to avoid touching call sites.
-      - Demo mode argument is accepted for compatibility, but not displayed here
-        (blank means blank).
+    Expected fields (generator writes these):
+      - event_type: 'fixation'
+      - fix_dur: duration in seconds
+
+    For robustness, this also falls back to common duration columns.
     """
-    if total_seconds is None or total_seconds <= 0:
-        return
 
-    total_seconds = float(total_seconds)
+    # Determine onset and duration.
+    # Standard mode typically provides 'trial_onset' and 'trial_duration'.
+    # 3-event mode provides 'img_onset' and 'trial_duration_max'.
+    try:
+        if mode == 'standard':
+            t0 = float(trial.get('trial_onset', clock.getTime()))
+            dur = float(trial.get('fix_dur', trial.get('trial_duration', 0.0)))
+        else:
+            t0 = float(trial.get('img_onset', clock.getTime()))
+            dur = float(trial.get('fix_dur', trial.get('trial_duration_max', 0.0)))
+    except Exception:
+        t0 = clock.getTime()
+        try:
+            dur = float(trial.get('fix_dur', 0.0))
+        except Exception:
+            dur = 0.0
 
-    clk = core.Clock()
-    clk.reset()
+    if dur is None or dur <= 0:
+        return {
+            'response': None, 'rt': None,
+            'target': None, 'correct_key': None,
+            'accuracy': None, 'img': None,
+            'skipped': 0
+        }
+
+    t_end = t0 + float(dur)
     event.clearEvents()
 
-    while True:
+    # Wait until onset (if in the future), drawing fixation.
+    while clock.getTime() < t0:
         if event.getKeys(keyList=[EXIT_KEY]):
             core.quit()
-
-        if clk.getTime() >= total_seconds:
-            break
-
-        # Blank screen: do not draw any stimuli.
+        if _demo_skip_pressed(demo_mode):
+            # Fast-forward to end of this event
+            dt = max(0.0, t_end - clock.getTime())
+            if dt > 0:
+                clock.addTime(dt)
+            return {
+                'response': None, 'rt': None,
+                'target': None, 'correct_key': None,
+                'accuracy': None, 'img': None,
+                'skipped': 1
+            }
+        components['fixation'].draw()
+        breakdown = [f"Fix: {max(0.0, t0 - clock.getTime()):4.1f}s (to onset)"]
+        _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials,
+                          clock, t0, 'Fixation', t0, breakdown)
         win.flip()
+
+    # Hold fixation for duration.
+    while clock.getTime() < t_end:
+        if event.getKeys(keyList=[EXIT_KEY]):
+            core.quit()
+        if _demo_skip_pressed(demo_mode):
+            dt = max(0.0, t_end - clock.getTime())
+            if dt > 0:
+                clock.addTime(dt)
+            return {
+                'response': None, 'rt': None,
+                'target': None, 'correct_key': None,
+                'accuracy': None, 'img': None,
+                'skipped': 1
+            }
+
+        components['fixation'].draw()
+        breakdown = [f"Fix: {max(0.0, t_end - clock.getTime()):4.1f}s"]
+        _hud_set_and_draw(components, demo_mode, task_clock, trial_idx, n_trials,
+                          clock, t0, 'Fixation', t_end, breakdown)
+        win.flip()
+
+    return {
+        'response': None, 'rt': None,
+        'target': None, 'correct_key': None,
+        'accuracy': None, 'img': None,
+        'skipped': 0
+    }
 
 def run_experiment():
     # 1. Start Dialog: basic participant/run configuration
@@ -1169,9 +1229,7 @@ def run_experiment():
         'Fixed Decision Time': True,  # When True, always wait max_dec_dur before ISI2/Feedback
         'Demo Mode': False,
         # Tickbox: when True use scanner button mapping (1-4). When False use PC mapping (1,2,9,0)
-        'Scanner Buttons': True,
-        # When True, wait 10+15s after trigger (countdown then fixation)
-        'Enable Trigger Delay': True
+        'Scanner Buttons': True
     }
 
     # Define a helper for browsing (uses PsychoPy's GUI helpers)
@@ -1186,7 +1244,7 @@ def run_experiment():
     dlg = gui.DlgFromDict(
         info,
         title='Study 3 Launcher',
-        order=['Sub', 'Design CSV', 'Label CSV', 'Image Dir', 'Feedback Delay', 'Fixed Decision Time', 'Demo Mode', 'Scanner Buttons', 'Enable Trigger Delay'],
+        order=['Sub', 'Design CSV', 'Label CSV', 'Image Dir', 'Feedback Delay', 'Fixed Decision Time', 'Demo Mode', 'Scanner Buttons'],
         tip={
             'Design CSV': 'Leave blank to open file browser',
             'Label CSV': 'Leave blank to open file browser',
@@ -1227,7 +1285,6 @@ def run_experiment():
     fixed_decision_time = _to_bool(info.get('Fixed Decision Time'))
     # Determine button mapping based on scanner toggle (default: scanner mapping)
     use_scanner_buttons = _to_bool(info.get('Scanner Buttons'))
-    enable_trigger_delay = _to_bool(info.get('Enable Trigger Delay', True))
     # Update global keys mapping so other functions use the selected mapping
     global KEYS_RESP
     if use_scanner_buttons:
@@ -1311,9 +1368,6 @@ def run_experiment():
 while others will not. \n\nThe names of the objects won't change during the experiment."
     ), image_path="experimental_task/resources/alien_image.png",use_scanner_buttons=use_scanner_buttons)
     trigger_screen(win, components, mode, demo_mode, run_idx=1, n_runs=n_runs, run_label=runs[0][0])
-    # Wait 10s after trigger before the first trial starts (run 1)
-    if enable_trigger_delay:
-        _wait_post_trigger_delay(win, components, TRIGGER_DELAY_SECONDS, demo_mode=demo_mode)
 
     for run_idx, (run_label, run_df) in enumerate(runs, start=1):
         # Between-run flow (run 2+): close fullscreen -> GUI -> reopen fullscreen -> trigger screen
@@ -1326,9 +1380,6 @@ while others will not. \n\nThe names of the objects won't change during the expe
 
             win, components = create_window_and_components(demo_mode)
             trigger_screen(win, components, mode, demo_mode, run_idx=run_idx, n_runs=n_runs, run_label=run_label)
-            # Wait 10s after trigger before the first trial starts (this run)
-            if enable_trigger_delay:
-                _wait_post_trigger_delay(win, components, TRIGGER_DELAY_SECONDS, demo_mode=demo_mode)
 
         # Reset clocks per run (important for standard-mode absolute onsets)
         run_clock = core.Clock()
@@ -1338,24 +1389,61 @@ while others will not. \n\nThe names of the objects won't change during the expe
 
         trials = run_df.to_dict('records')
         n_trials = len(trials)
-        # Counterbalance correct-option button position within this run
-        target_btn_seq = generate_balanced_button_sequence(n_trials, n_buttons=len(KEYS_RESP), max_repeat=2, rng=random)
+
+        # Fixation-only rows (e.g., run-start / run-end fixations) are inserted by
+        # the design generator and should not count toward response counterbalancing.
+        def _is_fixation_event(row: dict) -> bool:
+            try:
+                ev = str(row.get('event_type', '')).strip().lower()
+            except Exception:
+                ev = ''
+            if ev in {'fixation', 'fix', 'rest'}:
+                return True
+            try:
+                cond = str(row.get('condition', '')).strip().lower()
+            except Exception:
+                cond = ''
+            if cond in {'fixation', 'rest'}:
+                return True
+            return False
+
+        stim_trials = [t for t in trials if not _is_fixation_event(t)]
+        target_btn_seq = generate_balanced_button_sequence(len(stim_trials), n_buttons=len(KEYS_RESP), max_repeat=2, rng=random)
+        stim_btn_i = 0
         run_rows = []  # per-run buffer for crash-safe saving
 
         for trial_idx, trial in enumerate(trials, start=1):
+            if _is_fixation_event(trial):
+                res = run_fixation_event(
+                    win, run_clock, trial, components, demo_mode,
+                    task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials,
+                    mode=mode
+                )
+                row = dict(trial)
+                row.update(res)
+                if 'skipped' not in row:
+                    row['skipped'] = 0
+                if run_col is not None and run_col not in row:
+                    row[run_col] = run_label
+                run_rows.append(row)
+                out_rows.append(row)
+                continue
+
             if mode == 'standard':
                 res = run_trial_standard(
                     win, run_clock, trial, components, label_data, info['Image Dir'],
                     demo_mode, task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials,
-                    target_button_idx=target_btn_seq[trial_idx-1]
+                    target_button_idx=target_btn_seq[stim_btn_i]
                 )
             else:
                 res = run_trial_3event(
                     win, run_clock, trial, components, label_data, info['Image Dir'],
                     demo_mode, feedback_delay, fixed_decision_time,
                     task_clock=task_clock, trial_idx=trial_idx, n_trials=n_trials,
-                    target_button_idx=target_btn_seq[trial_idx-1]
+                    target_button_idx=target_btn_seq[stim_btn_i]
                 )
+
+            stim_btn_i += 1
 
             row = dict(trial)
             row.update(res)
