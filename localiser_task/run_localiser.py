@@ -456,30 +456,30 @@ def run_localiser(params: Params):
     # Instructions (bilingual placeholders)
     if LANGUAGE == "japanese":
         instr1 = (
-            "画像閲覧"
+            "画像閲覧\n\n"
             "さまざまな画像のシーケンスが表示されます"
         )
         instr2 = (
-            "同じ画像が2回続けて表示されることもあります。"
-            "繰り返し画像（連続）が表示されたら、任意の応答ボタンを押します。"
+            "同じ画像が2回続けて表示されることもあります。\n"
+            "繰り返し画像（連続）が表示されたら、\n任意の応答ボタンを押します。"
         )
         instr3 = (
-            "迅速かつ正確に応答するようにしてください。応答が遅いと思われても心配しないでください。"
-            "シーケンス間の固定クロスに注目してください"
+            "迅速かつ正確に応答するようにしてください。\n応答が遅いと思われても心配しないでください。\n"
+            "シーケンス間の固定クロスに注目してください\n"
             "開始するには任意のボタンを押してください。"
         )
     else:
         instr1 = (
-            "Image viewing"
+            "Image viewing\n\n"
             "You will see different sequences of images"
         )
         instr2 = (
-            "Sometimes the SAME picture will appear twice in a row."
+            "Sometimes the SAME picture will appear twice in a row.\n"
             "When you see a repeat image (back-to-back), press ANY response button."
         )
         instr3 = (
-            "Try to respond quickly and accurately but don't worry if your response seems slow."
-            "Keep your eyes on the fixation cross between sequences."
+            "Try to respond quickly and accurately\nbut don't worry if your response seems slow.\n\n"
+            "Keep your eyes on the fixation cross between sequences.\n\n"
             "Press any button to start."
         )
 
