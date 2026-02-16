@@ -287,6 +287,38 @@ def safe_wait(duration: float, kb: keyboard.Keyboard, allowed_keys: List[str]) -
     return got_key, got_rt
 
 
+
+
+def between_run_dialog(next_run_idx: int, n_runs: int, trigger_key: str = TRIGGER_KEY):
+    """Native GUI dialog shown between runs (outside fullscreen).
+
+    Matches the *English* wording used in experimental_task.py, and provides a
+    Japanese equivalent when LANGUAGE == "japanese".
+
+    Flow intention:
+      - Close fullscreen after a run finishes
+      - Show this dialog
+      - Re-open fullscreen and show the trigger screen for the next run
+    """
+    if LANGUAGE == "japanese":
+        title = f"施行開始 {next_run_idx}"
+    else:
+        title = f"Start run {next_run_idx}"
+
+    dlg = gui.Dlg(title=title)
+
+    if LANGUAGE == "japanese":
+        dlg.addText("「OK」をクリックすると全画面で開きます。")
+        dlg.addText(f"次にトリガー画面で '{trigger_key}'を押して、施行 {next_run_idx} を開始します。")
+    else:
+        # Keep these strings aligned with experimental_task.py
+        dlg.addText("Click OK to open fullscreen.")
+        dlg.addText(f"Then press '{trigger_key}' on the trigger screen to begin run {next_run_idx}.")
+
+    dlg.show()
+    if not dlg.OK:
+        core.quit()
+
 def show_text_screen(win: visual.Window, text: str, kb: keyboard.Keyboard, advance_keys: List[str]):
     """Instruction / pause screen styled like experimental_task.py (white bg, black text)."""
     stim = visual.TextStim(
@@ -685,6 +717,30 @@ def run_localiser(params: Params):
                     kb,
                     advance_keys=resp_keys,
                 )
+
+
+                # Between-run flow (run 2+): close fullscreen -> GUI -> reopen fullscreen -> trigger screen
+                if run_idx < params.n_runs:
+                    try:
+                        win.close()
+                    except Exception:
+                        pass
+
+                    between_run_dialog(run_idx + 1, params.n_runs, trigger_key=TRIGGER_KEY)
+
+                    # Re-open fullscreen window and recreate per-window stimuli.
+                    win = create_window(params)
+                    kb = keyboard.Keyboard()
+
+                    img_stim = visual.ImageStim(
+                        win,
+                        image=None,
+                        pos=(0, 0),
+                        size=(DISPLAY_IMG_HEIGHT_FRAC, DISPLAY_IMG_HEIGHT_FRAC),
+                        interpolate=True,
+                        texRes=DEFAULT_TEXRES,
+                    )
+                    fixation = visual.TextStim(win, text="+", height=0.10, color=FG_COLOR)
 
         summ_path = os.path.join(
             out_dir,
