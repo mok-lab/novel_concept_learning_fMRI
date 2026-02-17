@@ -498,34 +498,37 @@ def draw_buttons(buttons, selected_key):
 
 
 def draw_buttons_feedback(buttons, response_made, correct_key):
-    """Draws buttons during Feedback phase and apply highlighting.
+    """Draw buttons during the Feedback phase and apply highlighting.
 
-    Behavioural requirements implemented here:
-      - Always highlight the correct option border in green to reveal the target.
-      - If the participant selected an incorrect option, highlight the selected
-        option border in red to indicate the error.
-      - Make the highlight thicker than the standard border for visibility.
-      - Fill remains neutral to keep label text readable.
+    Behaviour:
+      - If *no response* was made (response_made is None), draw buttons in a neutral
+        state (no green/red feedback borders).
+      - If a response was made:
+          * highlight the correct option border in green
+          * if the response was incorrect, also highlight the chosen option in red
+      - Make highlight thicker than standard border for visibility.
+      - Keep fill neutral to preserve label readability.
     """
+    no_response = (response_made is None)
+
     for btn in buttons:
         btn['box'].fillColor = COL_NEUTRAL
         btn['box'].lineColor = 'black'
         btn['box'].lineWidth = LINE_W_NORMAL
 
-        # Correct option: green border (always)
-        if correct_key is not None and btn['key'] == correct_key:
-            btn['box'].lineColor = COL_CORRECT
-            btn['box'].lineWidth = LINE_W_HIGHLIGHT
+        if not no_response:
+            # Correct option: green border
+            if correct_key is not None and btn['key'] == correct_key:
+                btn['box'].lineColor = COL_CORRECT
+                btn['box'].lineWidth = LINE_W_HIGHLIGHT
 
-        # Incorrect selection: red border (in addition to correct border elsewhere)
-        if response_made is not None and response_made != correct_key and btn['key'] == response_made:
-            btn['box'].lineColor = COL_INCORRECT
-            btn['box'].lineWidth = LINE_W_HIGHLIGHT
+            # Incorrect selection: red border (in addition to correct border elsewhere)
+            if response_made != correct_key and btn['key'] == response_made:
+                btn['box'].lineColor = COL_INCORRECT
+                btn['box'].lineWidth = LINE_W_HIGHLIGHT
 
         btn['box'].draw()
         btn['text'].draw()
-
-
 def setup_trial_visuals(trial, components, label_data, img_dir, demo_mode, target_button_idx=None):
     """Common setup logic for both timing modes.
 
