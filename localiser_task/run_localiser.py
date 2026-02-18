@@ -106,6 +106,7 @@ class Params:
     img_s: float = DEFAULT_IMG_S
     isi_s: float = DEFAULT_ISI_S
     trials_per_block: int = DEFAULT_TRIALS_PER_BLOCK
+    show_run_summary: bool = False
 
 
 def list_category_folders(parent_dir: str) -> List[str]:
@@ -710,13 +711,14 @@ def run_localiser(params: Params):
                         "Press a button to continue."
                     )
 
-                show_text_screen(
-                    win,
-                    end_text,
-
-                    kb,
-                    advance_keys=resp_keys,
-                )
+                # Show end-of-run summary only if requested via GUI
+                if params.show_run_summary:
+                    show_text_screen(
+                        win,
+                        end_text,
+                        kb,
+                        advance_keys=resp_keys,
+                    )
 
 
                 # Between-run flow (run 2+): close fullscreen -> GUI -> reopen fullscreen -> trigger screen
@@ -792,6 +794,7 @@ def get_params_from_gui() -> Params:
         "img_tex_size": DEFAULT_IMG_TEX_SIZE,
         "fullscreen": True,
         "screen_index": 0,
+        "show_run_summary": False,
     }
 
     dlg = gui.DlgFromDict(
@@ -807,6 +810,7 @@ def get_params_from_gui() -> Params:
             "img_tex_size",
             "fullscreen",
             "screen_index",
+            "show_run_summary",
         ],
         tip={
             "language": "On-screen language: english or japanese (japanese currently prefixes strings with [japanese]).",
@@ -815,6 +819,7 @@ def get_params_from_gui() -> Params:
             "n_targets_per_run": "Total number of one-back repeats across the entire run.",
             "img_tex_size": "Pixel resolution of loaded images after crop/resize (display size is fixed at ~60% screen height).",
             "screen_index": "Which monitor to use (0 = primary).",
+            "show_run_summary": "When enabled, show hit/false-alarm summary at the end of each run (default: off).",
         }
     )
     if not dlg.OK:
@@ -843,6 +848,7 @@ def get_params_from_gui() -> Params:
         img_tex_size=int(info["img_tex_size"]),
         fullscreen=bool(info["fullscreen"]),
         screen_index=int(info["screen_index"]),
+        show_run_summary=bool(info.get("show_run_summary", False)),
     )
 
 
