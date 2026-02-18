@@ -270,6 +270,9 @@ def _build_trialwise_interp(t_micro: np.ndarray, t_scan: np.ndarray,
     n_trials = int(onsets.size)
     X = np.zeros((t_scan.size, n_trials), dtype=float)
     for j in range(n_trials):
+        # Skip fixation/non-event rows (NaN onset/duration or non-positive duration)
+        if not (np.isfinite(onsets[j]) and np.isfinite(durs[j]) and float(durs[j]) > 0):
+            continue
         u = np.zeros(t_micro.size, dtype=float)
         onset_idx = int(round(onsets[j] / dt))
         dur_idx = max(1, int(round(durs[j] / dt)))
@@ -288,6 +291,8 @@ def _build_condition_level_interp(t_micro: np.ndarray, t_scan: np.ndarray,
     dt = float(t_micro[1] - t_micro[0])
     u = np.zeros(t_micro.size, dtype=float)
     for j in range(onsets.size):
+        if not (np.isfinite(onsets[j]) and np.isfinite(durs[j]) and float(durs[j]) > 0):
+            continue
         onset_idx = int(round(onsets[j] / dt))
         dur_idx = max(1, int(round(durs[j] / dt)))
         last_idx = min(u.size - 1, onset_idx + dur_idx - 1)
@@ -1870,62 +1875,97 @@ def simulate_one_run(df_run: pd.DataFrame,
             C_hp=C,
         )
 
+    # ----------------------------
+    # Trial masks (exclude fixation / non-event rows from estimation + metrics)
+    # ----------------------------
+    # A trial is "valid" for an event type if its regressor column has any non-zero energy.
+    # This is robust to fixation rows represented by NaN onsets/durations (which yield all-zero columns).
+    enc_keep = np.linalg.norm(X_enc, axis=0) > 0
+    dec_keep = np.linalg.norm(X_dec, axis=0) > 0
+    fb_keep  = np.linalg.norm(X_fb,  axis=0) > 0
+
+    # Build nuisance regressors
     if nuisance_model == "summed":
         x_dec = X_dec.sum(axis=1, keepdims=True)
         x_fb  = X_fb.sum(axis=1, keepdims=True)
         X_nuis = np.column_stack([x_dec, x_fb, C])
     elif nuisance_model == "trialwise":
-        X_nuis = np.column_stack([X_dec, X_fb, C])
+        # Drop all-zero nuisance columns so fixation rows do not introduce singular columns.
+        X_dec_use = X_dec[:, dec_keep] if np.any(dec_keep) else np.zeros((n_scans, 0), float)
+        X_fb_use  = X_fb[:,  fb_keep]  if np.any(fb_keep)  else np.zeros((n_scans, 0), float)
+        X_nuis = np.column_stack([X_dec_use, X_fb_use, C])
     else:
         raise ValueError("nuisance_model must be 'summed' or 'trialwise'")
 
+    # ----------------------------
+    # Encoding trialwise estimation (exclude invalid/fixation trials)
+    # ----------------------------
+    X_enc_use = X_enc[:, enc_keep] if np.any(enc_keep) else np.zeros((n_scans, 0), float)
+
     # LS-A
-    X_lsa = np.column_stack([X_enc, X_nuis])
+    X_lsa = np.column_stack([X_enc_use, X_nuis])
     Bhat = pinv_beta(X_lsa, Y)
-    Bhat_enc_lsa = Bhat[:n_trials, :]
+    Bhat_enc_lsa = np.full((n_trials, n_vox), np.nan, float)
+    if X_enc_use.shape[1] > 0:
+        Bhat_enc_lsa[enc_keep, :] = Bhat[:X_enc_use.shape[1], :]
 
     # LS-S
-    Bhat_enc_lss = np.zeros_like(Bhat_enc_lsa) # Initialize with correct shape
-    
-    # Pre-calculate X_others sum to speed up loop
-    X_enc_sum = X_enc.sum(axis=1, keepdims=True)
-    
-    for j in range(n_trials):
-        x_this = X_enc[:, [j]]
-        # Efficiently calculate "others" by subtracting current from sum
-        x_others = X_enc_sum - x_this
-        
-        X_lss = np.column_stack([x_this, x_others, X_nuis])
-        b = pinv_beta(X_lss, Y)
-        Bhat_enc_lss[j] = b[0, :]
+    Bhat_enc_lss = np.full((n_trials, n_vox), np.nan, float)
+
+    if X_enc_use.shape[1] > 0:
+        # Pre-calculate X_others sum to speed up loop (valid trials only)
+        X_enc_sum = X_enc_use.sum(axis=1, keepdims=True)
+
+        keep_idx = np.flatnonzero(enc_keep)
+        for jj, j in enumerate(keep_idx):
+            x_this = X_enc[:, [j]]  # use original column (identical to X_enc_use[:, [jj]])
+            x_others = X_enc_sum - x_this
+            X_lss = np.column_stack([x_this, x_others, X_nuis])
+            b = pinv_beta(X_lss, Y)
+            Bhat_enc_lss[j, :] = b[0, :]
 
 
     # 8. Anchored RSA recovery (per trial), plus null baselines
-    rsa_anchor_lsa = anchored_trial_rsa(P_enc, Bhat_enc_lsa)
-    rsa_anchor_lss = anchored_trial_rsa(P_enc, Bhat_enc_lss)
+
+    # 8. Anchored RSA recovery (per trial), plus null baselines
+    # Only evaluate recovery/RSA on valid encoding trials (exclude fixation/non-event rows)
+    P_enc_valid = P_enc[enc_keep, :] if np.any(enc_keep) else np.zeros((0, P_enc.shape[1]), float)
+    Bhat_lsa_valid = Bhat_enc_lsa[enc_keep, :] if np.any(enc_keep) else np.zeros((0, Bhat_enc_lsa.shape[1]), float)
+    Bhat_lss_valid = Bhat_enc_lss[enc_keep, :] if np.any(enc_keep) else np.zeros((0, Bhat_enc_lss.shape[1]), float)
+
+    rsa_anchor_lsa = anchored_trial_rsa(P_enc_valid, Bhat_lsa_valid) if P_enc_valid.shape[0] >= 3 else np.full((P_enc_valid.shape[0],), np.nan, float)
+    rsa_anchor_lss = anchored_trial_rsa(P_enc_valid, Bhat_lss_valid) if P_enc_valid.shape[0] >= 3 else np.full((P_enc_valid.shape[0],), np.nan, float)
 
     # Category-level anchored RSA (if category labels available)
-    cats = category_labels_from_df(df_run)
-    rsa_cat_lsa = anchored_category_rsa(P_enc, Bhat_enc_lsa, cats) if cats is not None else {
+    cats_all = category_labels_from_df(df_run)
+    cats_valid = cats_all[enc_keep] if (cats_all is not None and np.any(enc_keep)) else None
+    rsa_cat_lsa = anchored_category_rsa(P_enc_valid, Bhat_lsa_valid, cats_valid) if cats_valid is not None else {
         "scores": None, "mean": float("nan"), "rdm_spearman": float("nan"), "n_cat": 0
     }
-    rsa_cat_lss = anchored_category_rsa(P_enc, Bhat_enc_lss, cats) if cats is not None else {
+    rsa_cat_lss = anchored_category_rsa(P_enc_valid, Bhat_lss_valid, cats_valid) if cats_valid is not None else {
         "scores": None, "mean": float("nan"), "rdm_spearman": float("nan"), "n_cat": 0
     }
 
     # Voxel-shuffle null (break voxel correspondence; better than trial-identity shuffles when categories repeat)
     rsa_anchor_lsa_null = anchored_trial_rsa_voxelshuffle_null(
-    P_enc, Bhat_enc_lsa,
+    P_enc_valid, Bhat_lsa_valid,
     null_perms=rsa_null_perms,
     rng=rng,
     shuffle_mode=rsa_shuffle_mode
     )
-    rsa_anchor_lss_null = anchored_trial_rsa_voxelshuffle_null(P_enc, Bhat_enc_lss, null_perms=rsa_null_perms, rng=rng, shuffle_mode="global")
+    rsa_anchor_lss_null = anchored_trial_rsa_voxelshuffle_null(P_enc_valid, Bhat_lss_valid, null_perms=rsa_null_perms, rng=rng, shuffle_mode="global")
 
-    # Optional category-mismatch null if category labels exist in df_run
-    cats = category_mismatch_null_indices(df_run)
-    rsa_anchor_lsa_catnull = anchored_trial_rsa_category_null(P_enc, Bhat_enc_lsa, cats) if cats is not None else {"null_mean": float("nan")}
-    rsa_anchor_lss_catnull = anchored_trial_rsa_category_null(P_enc, Bhat_enc_lss, cats) if cats is not None else {"null_mean": float("nan")}
+    # Optional category-mismatch null if category labels exist in df_run (valid encoding trials only)
+    cats_null_all = category_mismatch_null_indices(df_run)
+    cats_null_valid = cats_null_all[enc_keep] if (cats_null_all is not None and np.any(enc_keep)) else None
+    rsa_anchor_lsa_catnull = anchored_trial_rsa_category_null(P_enc_valid, Bhat_lsa_valid, cats_null_valid) if cats_null_valid is not None else {"null_mean": float("nan")}
+    rsa_anchor_lss_catnull = anchored_trial_rsa_category_null(P_enc_valid, Bhat_lss_valid, cats_null_valid) if cats_null_valid is not None else {"null_mean": float("nan")}
+    # Per-trial recoverability correlations: report only for valid encoding trials.
+    rec_lsa_full = np.full((n_trials,), np.nan, float)
+    rec_lss_full = np.full((n_trials,), np.nan, float)
+    if P_enc_valid.shape[0] > 0:
+        rec_lsa_full[enc_keep] = corr_rows(P_enc_valid, Bhat_lsa_valid)
+        rec_lss_full[enc_keep] = corr_rows(P_enc_valid, Bhat_lss_valid)
 
     return {
         "Y": Y,
@@ -1934,8 +1974,8 @@ def simulate_one_run(df_run: pd.DataFrame,
         "Bhat_enc_lss": Bhat_enc_lss,
         "prewhiten": prewhiten,
         "ar1_rho": ar1_rho,
-        "rec_lsa": corr_rows(P_enc, Bhat_enc_lsa),
-        "rec_lss": corr_rows(P_enc, Bhat_enc_lss),
+        "rec_lsa": rec_lsa_full,
+        "rec_lss": rec_lss_full,
         "rsa_anchor_lsa": rsa_anchor_lsa,
         "rsa_anchor_lss": rsa_anchor_lss,
         "rsa_cat_lsa": rsa_cat_lsa,
@@ -2283,19 +2323,37 @@ def evaluate_design_stage1(df: pd.DataFrame,
         if G.empty:
             continue
 
-        # --- Onsets/durations (trial count comes from design file) ---
-        enc_on = G["img_onset"].to_numpy(float)
-        enc_dur = G["img_dur"].to_numpy(float)
+                # --- Onsets/durations ---
+        # IMPORTANT: exclude fixation / non-event rows from *trialwise* collinearity metrics.
+        # We do this by masking out any rows with non-finite onset or non-finite/<=0 duration for each event.
+        enc_on_all = G["img_onset"].to_numpy(float)
+        enc_dur_all = G["img_dur"].to_numpy(float)
 
-        dec_on = G["dec_onset_est"].to_numpy(float)
-        dec_dur = G["max_dec_dur"].to_numpy(float)
+        dec_on_all = G["dec_onset_est"].to_numpy(float)
+        dec_dur_all = G["max_dec_dur"].to_numpy(float)
 
-        isi2 = G["isi2_dur"].to_numpy(float)
-        fb_on = dec_on + dec_dur + isi2
-        fb_dur = G["fb_dur"].to_numpy(float)
+        isi2_all = G["isi2_dur"].to_numpy(float)
+        fb_on_all = dec_on_all + dec_dur_all + isi2_all
+        fb_dur_all = G["fb_dur"].to_numpy(float)
 
-        # Run length / sampling
-        run_end = float(np.max(fb_on + fb_dur)) + float(pad_s) + float(HRF_TAIL_S)
+        enc_keep = np.isfinite(enc_on_all) & np.isfinite(enc_dur_all) & (enc_dur_all > 0)
+        dec_keep = np.isfinite(dec_on_all) & np.isfinite(dec_dur_all) & (dec_dur_all > 0)
+        fb_keep  = np.isfinite(fb_on_all)  & np.isfinite(fb_dur_all)  & (fb_dur_all  > 0)
+
+        enc_on = enc_on_all[enc_keep]
+        enc_dur = enc_dur_all[enc_keep]
+        dec_on = dec_on_all[dec_keep]
+        dec_dur = dec_dur_all[dec_keep]
+        fb_on = fb_on_all[fb_keep]
+        fb_dur = fb_dur_all[fb_keep]
+
+        # Run length / sampling (robust to NaNs)
+        enc_end = enc_on_all + enc_dur_all
+        fb_end = fb_on_all + fb_dur_all
+        ends = np.concatenate([enc_end.reshape(-1), fb_end.reshape(-1)])
+        finite = np.isfinite(ends)
+        max_end = float(np.max(ends[finite])) if np.any(finite) else 0.0
+        run_end = max_end + float(pad_s) + float(HRF_TAIL_S)
         n_scans = int(math.ceil(run_end / float(TR)))
         n_scans = max(n_scans, 2)  # hard safety: should not happen for valid designs, but prevents degenerate bases
 
@@ -3783,10 +3841,10 @@ def main():
                 "nuisance_model": args.nuisance_model,
                 "prewhiten": str(res.get("prewhiten", "")),
                 "ar1_rho": float(res.get("ar1_rho", float("nan"))),
-                "lsa_mean": float(res["rec_lsa"].mean()),
-                "lsa_p05": float(np.percentile(res["rec_lsa"], 5)),
-                "lss_mean": float(res["rec_lss"].mean()),
-                "lss_p05": float(np.percentile(res["rec_lss"], 5)),
+                "lsa_mean": float(np.nanmean(res["rec_lsa"])),
+                "lsa_p05": float(np.nanpercentile(res["rec_lsa"], 5)),
+                "lss_mean": float(np.nanmean(res["rec_lss"])),
+                "lss_p05": float(np.nanpercentile(res["rec_lss"], 5)),
                 "rsa_anchor_lsa_mean": float(np.nanmean(res["rsa_anchor_lsa"])),
                 "rsa_anchor_lsa_p05": float(np.nanpercentile(res["rsa_anchor_lsa"], 5)),
                 "rsa_anchor_lsa_null_mean": float(res["rsa_anchor_lsa_null"].get("null_mean", float("nan"))),
